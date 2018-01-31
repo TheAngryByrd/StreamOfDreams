@@ -1,4 +1,10 @@
 source https://www.nuget.org/api/v2
+clitool Microsoft.DotNet.Watcher.Tools
+clitool dotnet-mono
+
+nuget fsharp.core
+nuget SourceLink.Create.CommandLine copy_local: true
+nuget Expecto
 
 group Build
     source https://www.nuget.org/api/v2
