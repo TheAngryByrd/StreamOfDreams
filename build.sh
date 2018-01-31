@@ -43,7 +43,7 @@ yesno() {
 }
 
 set +e
-run $PAKET_BOOTSTRAPPER_EXE 5.132.4
+run $PAKET_BOOTSTRAPPER_EXE 
 bootstrapper_exitcode=$?
 set -e
 

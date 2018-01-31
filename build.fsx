@@ -7,8 +7,12 @@ open Fake.UserInputHelper
 open System
 
 let release = LoadReleaseNotes "RELEASE_NOTES.md"
+
+let sln = "StreamOfDreams.sln"
 let srcGlob = "src/**/*.fsproj"
 let testsGlob = "tests/**/*.fsproj"
+
+let (^) f x = f x
 
 Target "Clean" (fun _ ->
     ["bin"; "temp" ;"dist"]
@@ -25,28 +29,25 @@ Target "Clean" (fun _ ->
 
     )
 
-Target "DotnetRestore" (fun _ ->
+Target "DotnetRestore" ^ fun _ ->
     !! srcGlob
     ++ testsGlob
-    |> Seq.iter (fun proj ->
-        DotNetCli.Restore (fun c ->
+    |> Seq.iter ^ fun proj ->
+        DotNetCli.Restore ^ fun c ->
             { c with
                 Project = proj
                 //This makes sure that Proj2 references the correct version of Proj1
                 AdditionalArgs = [sprintf "/p:PackageVersion=%s" release.NugetVersion]
-            })
-))
+            }
 
-Target "DotnetBuild" (fun _ ->
-    !! srcGlob
-    |> Seq.iter (fun proj ->
-        DotNetCli.Build (fun c ->
-            { c with
-                Project = proj
-                //This makes sure that Proj2 references the correct version of Proj1
-                AdditionalArgs = [sprintf "/p:PackageVersion=%s" release.NugetVersion]
-            })
-))
+Target "DotnetBuild" ^ fun _ ->
+    DotNetCli.Build ^ fun c ->
+        { c with
+            Project = sln
+            //This makes sure that Proj2 references the correct version of Proj1
+            AdditionalArgs = [sprintf "/p:PackageVersion=%s" release.NugetVersion]
+        }
+
 
 let invoke f = f ()
 let invokeAsync f = async { f () }
@@ -82,22 +83,23 @@ let selectRunnerForFramework tf =
 
 let runTests modifyArgs =
     !! testsGlob
-    |> Seq.map(fun proj -> proj, getTargetFrameworksFromProjectFile proj)
-    |> Seq.collect(fun (proj, targetFrameworks) ->
+    |> Seq.map ^ fun proj ->
+        proj, getTargetFrameworksFromProjectFile proj
+    |> Seq.collect ^ fun (proj, targetFrameworks) ->
         targetFrameworks
         |> Seq.map selectRunnerForFramework
-        |> Seq.map(fun args -> fun () ->
+        |> Seq.map ^ fun args -> fun () ->
             DotNetCli.RunCommand (fun c ->
             { c with
                 WorkingDir = IO.Path.GetDirectoryName proj
-            }) (modifyArgs args))
-    )
+            }) (modifyArgs args)
 
 
-Target "DotnetTest" (fun _ ->
-    runTests id
-    |> Seq.iter (invoke)
-)
+Target "DotnetTest" ^ fun _ ->
+    runTests (sprintf "%s --no-build")
+    |> Seq.iter invoke
+
+
 let execProcAndReturnMessages filename args =
     let args' = args |> String.concat " "
     ProcessHelper.ExecProcessAndReturnMessages
@@ -128,10 +130,10 @@ Target "WatchTests" (fun _ ->
         ()
 )
 
-Target "DotnetPack" (fun _ ->
+Target "DotnetPack" ^ fun _ ->
     !! srcGlob
-    |> Seq.iter (fun proj ->
-        DotNetCli.Pack (fun c ->
+    |> Seq.iter ^ fun proj ->
+        DotNetCli.Pack ^ fun c ->
             { c with
                 Project = proj
                 Configuration = "Release"
@@ -142,20 +144,18 @@ Target "DotnetPack" (fun _ ->
                         sprintf "/p:PackageReleaseNotes=\"%s\"" (String.Join("\n",release.Notes))
                         "/p:SourceLinkCreate=true"
                     ]
-            })
-    )
-)
+            }
 
-Target "Publish" (fun _ ->
-    Paket.Push(fun c ->
+
+
+Target "Publish" ^ fun _ ->
+    Paket.Push ^ fun c ->
             { c with
                 PublishUrl = "https://www.nuget.org"
                 WorkingDir = "dist"
             }
-        )
-)
 
-Target "Release" (fun _ ->
+Target "Release" ^ fun _ ->
 
     if Git.Information.getBranchName "" <> "master" then failwith "Not on master"
 
@@ -165,10 +165,9 @@ Target "Release" (fun _ ->
 
     Branches.tag "" release.NugetVersion
     Branches.pushTag "" "origin" release.NugetVersion
-)
 
 "Clean"
-  ==> "DotnetRestore"
+//   ==> "DotnetRestore"
   ==> "DotnetBuild"
   ==> "DotnetTest"
   ==> "DotnetPack"
