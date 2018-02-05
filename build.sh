@@ -76,7 +76,21 @@ fi
 
 run $PAKET_EXE restore
 
-[ ! -e build.fsx ] && run $PAKET_EXE update
-[ ! -e build.fsx ] && run $FAKE_EXE init.fsx
-run $FAKE_EXE "$@" $FSIARGS $FSIARGS2 build.fsx
+if lsof -ti :5432 > /dev/null
+then 
+   echo "postgres already started"
+else 
+  echo "starting postgres"
+  rm -rf data/
+  initdb -D data/
+  postgres -D data &
+  sleep 3  
+#   createdb demo
+fi
+
+POSTGRES_HOST=localhost \
+    POSTGRES_USER=$(whoami) \
+    POSTGRES_PASS=postgres \
+    POSTGRES_DB=postgres \
+    run $FAKE_EXE "$@" $FSIARGS $FSIARGS2 build.fsx
 

@@ -30,12 +30,9 @@ Target "Clean" (fun _ ->
     )
 
 Target "DotnetRestore" ^ fun _ ->
-    !! srcGlob
-    ++ testsGlob
-    |> Seq.iter ^ fun proj ->
         DotNetCli.Restore ^ fun c ->
             { c with
-                Project = proj
+                Project = sln
                 //This makes sure that Proj2 references the correct version of Proj1
                 AdditionalArgs = [sprintf "/p:PackageVersion=%s" release.NugetVersion]
             }
@@ -95,6 +92,11 @@ let runTests modifyArgs =
             }) (modifyArgs args)
 
 
+
+Target "DotnetTestSolo" ^ fun _ ->
+    runTests (sprintf "%s")
+    |> Seq.iter invoke
+
 Target "DotnetTest" ^ fun _ ->
     runTests (sprintf "%s --no-build")
     |> Seq.iter invoke
@@ -116,7 +118,7 @@ let killParentsAndChildren processId=
 
 
 Target "WatchTests" (fun _ ->
-    runTests (sprintf "watch %s")
+    runTests (sprintf "watch %s --no-restore")
     |> Seq.iter (invokeAsync >> Async.Catch >> Async.Ignore >> Async.Start)
 
     printfn "Press enter to stop..."
@@ -166,9 +168,9 @@ Target "Release" ^ fun _ ->
     Branches.tag "" release.NugetVersion
     Branches.pushTag "" "origin" release.NugetVersion
 
-"Clean"
+// "Clean"
 //   ==> "DotnetRestore"
-  ==> "DotnetBuild"
+"DotnetBuild"
   ==> "DotnetTest"
   ==> "DotnetPack"
   ==> "Publish"

@@ -3,9 +3,17 @@ clitool Microsoft.DotNet.Watcher.Tools
 clitool dotnet-mono
 
 nuget fsharp.core
+nuget Newtonsoft.Json
+nuget npgsql
+nuget Simple.Migrations 0.9.18
 nuget SourceLink.Create.CommandLine copy_local: true
 nuget Expecto
+nuget Expecto.BenchmarkDotNet
+nuget Hopac
+nuget System.Reactive
+nuget Giraffe.Tasks 0.1.0-beta-010 beta
 
 group Build
+    framework: net462
     source https://www.nuget.org/api/v2
     nuget FAKE
