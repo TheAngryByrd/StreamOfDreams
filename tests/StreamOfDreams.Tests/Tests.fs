@@ -242,7 +242,7 @@ module All =
         let range = (DateTimeOffset.UtcNow - start).Days;
         start.AddDays(r.Next(range) |> float)
 
-
+    // TODO:  One or more errors occurred. (Out of the range of DateTime (year must be between 1 and 9999
     let generatePeopleEvents howMany =
         let r = Random(42)
 
@@ -314,33 +314,33 @@ module All =
                 }
             ]
         ]
-    let readForwardBenchTest limit =
-        job {
-                use db = getMigratedDatabase ()
-                let connStr = helpfulConnStrAddtions db.Conn
-                use connection = new NpgsqlConnection(connStr |> string)
-                do! connection |> ensureOpen
-                let streamName = "Bank-12345"
-                do!
-                    [0..10]
-                    |> Seq.map ^ fun _ -> job {
-                        let events = generatePeopleEvents 13107
-                        do! Commands.appendToStream connStr streamName Commands.Version.Any events }
-                    |> Job.seqIgnore
-                let! result = Repository.getStreamByName connection streamName
-                Expect.isSome result "Should find Some"
-                // printfn "%A" result
+    // let readForwardBenchTest limit =
+    //     job {
+    //             use db = getMigratedDatabase ()
+    //             let connStr = helpfulConnStrAddtions db.Conn
+    //             use connection = new NpgsqlConnection(connStr |> string)
+    //             do! connection |> ensureOpen
+    //             let streamName = "Bank-12345"
+    //             do!
+    //                 [0..10]
+    //                 |> Seq.map ^ fun _ -> job {
+    //                     let events = generatePeopleEvents 13107
+    //                     do! Commands.appendToStream connStr streamName Commands.Version.Any events }
+    //                 |> Job.seqIgnore
+    //             let! result = Repository.getStreamByName connection streamName
+    //             Expect.isSome result "Should find Some"
+    //             // printfn "%A" result
 
-                let! events =
-                    //Job.benchmark "readEventsForward" ^ fun _ ->
-                    Repository.readEventsForward connection streamName 0 limit
-                let events = Option.get events
-                let! length =
-                      Job.benchmark "readEventsForwardReal" ^ fun _ ->
-                        events
-                        |> Stream.foldFun (fun state item -> state + 1) 0
-                printfn "records %A" length
-        }
+    //             let! events =
+    //                 //Job.benchmark "readEventsForward" ^ fun _ ->
+    //                 Repository.readEventsForward connection streamName 0 limit
+    //             let events = Option.get events
+    //             let! length =
+    //                   Job.benchmark "readEventsForwardReal" ^ fun _ ->
+    //                     events
+    //                     |> Stream.foldFun (fun state item -> state + 1) 0
+    //             printfn "records %A" length
+    //     }
 
     // module Benchmarks =
     //     open BenchmarkDotNet.Attributes
@@ -389,28 +389,33 @@ module All =
             yield! testFixtureAsync withMigratedDatabase [
                 testCaseJob' "Append test" <| fun db -> job {
                     let connStr = helpfulConnStrAddtions db.Conn
+                    let! writer = Commands.create connStr
                     use connection = new NpgsqlConnection(connStr |> string)
                     do! connection |> ensureOpen
-                    let streamName = "Bank-12345"
-                    do!
-                        [0..0]
-                        |> Seq.map ^ fun _ -> job {
-                            let events = generatePeopleEvents 13107
-                            do! Commands.appendToStream connStr streamName Commands.Version.Any events }
-                        |> Job.seqIgnore
-                    let! result = Repository.getStreamByName connection streamName
-                    Expect.isSome result "Should find Some"
-                    printfn "%A" result
+                    let streamName = "Bank-12456"
+                    let eventsToGenerate = 13
+                    let! writeResult =
+                        let events = generatePeopleEvents eventsToGenerate |> Seq.toArray
+                        Commands.appendToStream (streamName) DomainTypes.Version.Any events writer
+
+                    Expect.equal writeResult.NextExpectedVersion (uint64 eventsToGenerate) "Not expected Version"
+
+                    let! allStream = Repository.getStreamByName connection "$all" |> Job.map Option.get
+                    Expect.equal allStream.Version (uint64 eventsToGenerate) "Not expected Version"
+
+                    let! stream = Repository.getStreamByName connection (streamName) |> Job.map Option.get
+                    Expect.equal stream.Version (uint64 eventsToGenerate) "Not expected Version"
 
                     let! events =
-                        Job.benchmark "readEventsForward" ^ fun _ -> Repository.readEventsForward connection streamName 0 1000
-                    let events = Option.get events
+                         Repository.readEventsForward connection streamName 0 10000
+                         |> Job.map Option.get
+
                     let! length =
                           Job.benchmark "readEventsForwardReal" ^ fun _ ->
                             events
-                            |> Stream.mapFun (fun x -> x.Data |> Json.deserialize<Person>)
                             |> Stream.foldFun (fun x s -> x + 1) 0
-                    printfn "records %A" length
+                    Expect.equal length (eventsToGenerate) "Events not written to stream"
+
 
                 }
             ]

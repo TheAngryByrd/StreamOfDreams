@@ -1,34 +1,43 @@
 namespace StreamOfDreams
 
-open System
-open System.Threading
-open System.Reactive.Disposables
-open System.Net.Mail
-open Migrations
-
 [<AutoOpen>]
 module Infrastructure =
     let (^) x = (<|) x
 
-
-module Job =
+module Hopac =
     open Hopac
-    let inline usingJob (xJ : Job<'a>) (xJyJ : 'a -> Job<'b>)=
-        xJ
-        |> Job.bind ^ fun dis ->
-            Job.using dis xJyJ
+    open Hopac.Infixes
+    module Actors =
+        type Actor<'msg> = Mailbox<'msg>
+        type ReplyChannel<'a> = IVar<'a>
+        let actor (body: Actor<'msg> -> Job<unit>) : Job<Mailbox<'msg>> = Job.delay <| fun () ->
+          let mA = Mailbox ()
+          Job.start (body mA) >>-. mA
 
-    let inline usingJob' (xJyJ : 'a -> Job<'b>) (xJ : Job<'a>) =
-        usingJob xJ xJyJ
+        let post (mA: Mailbox<'msg>) (m: 'msg) : Job<unit> = mA *<<+ m
 
+        let postAndReply (mA: Mailbox<'msg>) (i2m: ReplyChannel<'r> -> 'msg) : Job<'r> = Job.delay <| fun () ->
+          let i = ReplyChannel ()
+          mA *<<+ i2m i >>=. i
 
-    let benchmark name (f : unit -> Job<'a>) = job {
-        let sw = System.Diagnostics.Stopwatch.StartNew()
-        let! result = f ()
-        sw.Stop()
-        printfn "%s took %A ms" name sw.ElapsedMilliseconds
-        return result
-    }
+        let reply (rI: ReplyChannel<'r>) (r: 'r) : Job<unit> = rI *<= r
+
+    module Job =
+        let inline usingJob (xJ : Job<'a>) (xJyJ : 'a -> Job<'b>)=
+            xJ
+            |> Job.bind ^ fun dis ->
+                Job.using dis xJyJ
+
+        let inline usingJob' (xJyJ : 'a -> Job<'b>) (xJ : Job<'a>) =
+            usingJob xJ xJyJ
+
+        let inline benchmark name (f : unit -> Job<'a>) = job {
+            let sw = System.Diagnostics.Stopwatch.StartNew()
+            let! result = f ()
+            sw.Stop()
+            printfn "%s took %A ms" name sw.ElapsedMilliseconds
+            return result
+        }
 
 
 module Dictionary =
@@ -80,16 +89,20 @@ module TypeInfo =
 
 module Json =
     open Newtonsoft.Json
-
     let inline serialize o =
         JsonConvert.SerializeObject o
-
     let inline deserialize<'a> o =
         JsonConvert.DeserializeObject<'a> o
 
-
 module DomainTypes =
     type StreamName = string
+
+    type Version =
+    | EmptyStream
+    | NoStream
+    | StreamExists
+    | Any
+    | Value of uint64
 
 module DbHelpers =
     open System
@@ -97,7 +110,7 @@ module DbHelpers =
     open NpgsqlTypes
     open Hopac
 
-    let builderToConnection (connStr : NpgsqlConnectionStringBuilder) =
+    let inline builderToConnection (connStr : NpgsqlConnectionStringBuilder) =
         new NpgsqlConnection (connStr |> string)
 
     let inline ensureOpen (connection : NpgsqlConnection) = job {
@@ -158,13 +171,14 @@ module DbHelpers =
         [0 .. reader.FieldCount - 1]
         |> List.map readValueAsync
         |> Job.seqCollect
+        |> Job.map List.ofSeq
 
     let inline readTable (reader: NpgsqlDataReader) =
         let rec readRows rows = job {
             let! canRead = reader.ReadAsync()
             if canRead then
               let! row = readRow reader
-              return! readRows (List.ofSeq row :: rows)
+              return! readRows (row :: rows)
             else
               return rows
         }
@@ -183,15 +197,15 @@ module DbTypes =
     open System
     open DomainTypes
 
+    /// Record for the stream table
     type Stream = {
         Id : int64
         Name : StreamName
         Version : uint64
         CreatedAt : DateTime
     }
-
+    /// A new event that has yet to be written
     type Event = {
-        Id : Guid
         EventType : string
         CorrelationId: Guid option
         CausationId: Guid option
@@ -201,7 +215,6 @@ module DbTypes =
         with
             static member CreateSimple eventType data =
                 {
-                    Id = Guid.NewGuid()
                     EventType = eventType
                     CorrelationId = None
                     CausationId = None
@@ -210,7 +223,6 @@ module DbTypes =
                 }
             static member AutoTypeData data =
                 {
-                    Id = Guid.NewGuid()
                     EventType = TypeInfo.typeNameToCamelCase data
                     CorrelationId = None
                     CausationId = None
@@ -219,7 +231,6 @@ module DbTypes =
                 }
             static member AutoTypeDataAndMeta data meta =
                 {
-                    Id = Guid.NewGuid()
                     EventType = TypeInfo.typeNameToCamelCase data
                     CorrelationId = None
                     CausationId = None
@@ -227,6 +238,7 @@ module DbTypes =
                     Metadata = Json.serialize meta |> Some
                 }
 
+    /// An event that has been written and is immutable
     type RecordedEvent = {
         Id : Guid
         Number : uint64
@@ -317,26 +329,30 @@ module Repository =
                 stream AS (
                   UPDATE streams SET stream_version = stream_version + @eventCount
                   WHERE stream_id = @streamId
-                  RETURNING stream_version - @eventCount as initial_stream_version
+                  RETURNING stream_version - @eventCount as initial_stream_version, stream_version AS next_expected_version
                 ),
                 events (index, event_id) AS (
                   VALUES {0}
+                ),
+                ignoring as (
+                  INSERT INTO stream_events
+                    (
+                      event_id,
+                      stream_id,
+                      stream_version,
+                      original_stream_id,
+                      original_stream_version
+                    )
+                      SELECT
+                        events.event_id,
+                        @streamId,
+                        stream.initial_stream_version + events.index,
+                        @streamId,
+                        stream.initial_stream_version + events.index
+                      FROM events, stream
                 )
-              INSERT INTO stream_events
-                (
-                  event_id,
-                  stream_id,
-                  stream_version,
-                  original_stream_id,
-                  original_stream_version
-                )
-              SELECT
-                events.event_id,
-                @streamId,
-                stream.initial_stream_version + events.index,
-                @streamId,
-                stream.initial_stream_version + events.index
-              FROM events, stream;
+
+              SELECT stream.next_expected_version FROM stream;
               """
 
         streamId |> inferredParam "streamId" |> addParameter cmd
@@ -625,18 +641,19 @@ module Repository =
 
 
 module Commands =
+    open System
     open Hopac
     open Npgsql
     open DbHelpers
-
+    open DomainTypes
     let AllStreamId = 0
-    type Version =
-    | Start
-    | Any
-    | Value of uint64
 
-    //TODO: Single writer, Actor
-    let appendToStream (connStr : NpgsqlConnectionStringBuilder) streamName version events = job {
+    type AppendResult = {
+        EventIds : Guid list
+        NextExpectedVersion : uint64
+    }
+
+    let internal appendToStream' (connStr : NpgsqlConnectionStringBuilder) streamName version events = job {
         use conn = builderToConnection connStr
         do! conn |> ensureOpen
         use transaction = conn.BeginTransaction()
@@ -644,55 +661,82 @@ module Commands =
         let! streamOpt = //Job.benchmark "getStreamByName" ^ fun () ->
                             Repository.getStreamByName conn streamName
 
+        let createStream () =
+            Repository.prepareCreateStream conn streamName
+            |> DbHelpers.executeNonQuery
+            |> Job.bind ^ fun _ ->
+                Repository.getStreamByName conn streamName
+            |> Job.map Option.get
         let! stream =
-            match streamOpt with
-            | Some s ->
-                s |> Job.result
-            | None ->
-                //Job.benchmark "prepareCreateStream" ^ fun () ->
-                    Repository.prepareCreateStream conn streamName
-                    |> DbHelpers.executeNonQuery
-                    |> Job.bind ^ fun _ ->
-                        Repository.getStreamByName conn streamName
-                    |> Job.map Option.get
-
-        //TODO: Figure out version checking
-        let nextVersion =
-            match version with
-            | Any -> stream.Version + 1UL
-            | Start ->
+            // https://eventstore.org/docs/dotnet-api/4.0.2/optimistic-concurrency-and-idempotence/
+            //TODO: Result type!
+            match streamOpt, version with
+            | Some stream, Any ->
+                stream |> Job.result
+            | None, Any ->
+                createStream ()
+            | Some _, NoStream ->
+                failwithf "Concurrency error. Expected no stream but was stream"
+            | None , NoStream ->
+                createStream ()
+            | Some stream, StreamExists ->
+                stream |> Job.result
+            | None , StreamExists ->
+                failwithf "Concurrency error. Expected stream but was no stream"
+            | Some stream, EmptyStream ->
                 if stream.Version <> 0UL then
-                    failwithf "Concurrency error. Stream expected to be started but at %A" stream.Version
-                0UL
-            | Value expectedVersion ->
-                if  expectedVersion > stream.Version then
-                    failwithf "Concurrency error.  Expected version higher than %A but got %A" stream.Version expectedVersion
-                expectedVersion
+                    failwithf "Concurrency error. Stream expected to be 0 but at %A" stream.Version
+                stream |> Job.result
+            | None, EmptyStream ->
+                failwith "Concurrency error. Stream expected to be created but has not"
+            | Some stream, Value version when stream.Version = version ->
+                stream |> Job.result
+            | Some stream, Value version ->
+                failwithf "Concurrency error. Stream expected to be %d but at %d" version stream.Version
+            | None, Value _ ->
+                failwith "Concurrency error. Stream expected to be created but has not"
+
+
 
         let! savedEvents =
            // Job.benchmark "insertEvents" ^ fun () ->
                 Repository.insertEvents conn events
 
 
-        let! result =
+        let! nextExpectedVersion =
             let foo = Repository.prepareCreateStreamEvents conn stream.Id (savedEvents)
             //Job.benchmark "prepareCreateStreamEvents" ^ fun _ ->
-            foo |> executeNonQuery
+            foo |> executeScalar<int64>
         let! result =
             let foo = Repository.prepareLinkEvents conn AllStreamId (savedEvents)
             //Job.benchmark "prepareLinkEvents" ^ fun _ ->
             foo |> executeNonQuery
         do! transaction.CommitAsync() |> Job.awaitUnitTask
-        //lookup stream
-        ()
-        // ensure version
-        // create if not exist
 
-        //map events to recorded events
-        //
-        // link to $all
+        return {
+            NextExpectedVersion = nextExpectedVersion |> uint64
+            EventIds = savedEvents
+        }
+
 
     }
+    open Hopac.Infixes
+    type Msg =
+    | AppendToStream of DomainTypes.StreamName*Version*DbTypes.RecordedEvent array*Actors.ReplyChannel<AppendResult>
+
+    let create connectionString =
+        Actors.actor <|
+            fun mb -> Job.foreverServer (Mailbox.take mb >>= function
+                | AppendToStream(name,version,events, reply) -> job {
+                    let! result = appendToStream' connectionString name version events
+                    do! Actors.reply reply result
+                }
+            )
+
+    let appendToStream name version events actor=
+        Actors.postAndReply actor (fun i -> AppendToStream(name,version,events,i))
+
+
 
 
 // module Fooy =

@@ -202,3 +202,60 @@ module Migrations =
                     DROP TRIGGER event_notification ON streams;
                     """
 
+    [<Migration(20180204124011L, "Create Subscriptions Table")>]
+    type ``Create Subscriptions Table`` () =
+        inherit Migration()
+            override __.Up () =
+                base.Execute
+                    """
+                    CREATE TABLE subscriptions
+                    (
+                        subscription_id bigserial PRIMARY KEY NOT NULL,
+                        stream_uuid text NOT NULL,
+                        subscription_name text NOT NULL,
+                        last_seen bigint NULL,
+                        created_at timestamp without time zone default (now() at time zone 'utc') NOT NULL
+                    );
+                    """
+
+            override __.Down () =
+                base.Execute
+                    """
+                    DROP TABLE subscriptions;
+                    """
+
+    [<Migration(20180204124012L, "Create Subscriptions index")>]
+    type ``Create Subscriptions index`` () =
+        inherit Migration()
+            override __.Up () =
+                base.Execute
+                    """
+                    CREATE UNIQUE INDEX ix_subscriptions_stream_uuid_subscription_name ON subscriptions (stream_uuid, subscription_name);
+                    """
+            override __.Down () =
+                base.Execute
+                    """
+                    DROP INDEX ix_subscriptions_stream_uuid_subscription_name;
+                    """
+    [<Migration(20180204124013L, "Create Snapshots Table")>]
+    type ``Create Snapshots Table`` () =
+        inherit Migration()
+            override __.Up () =
+                base.Execute
+                    """
+                    CREATE TABLE snapshots
+                    (
+                        source_uuid text PRIMARY KEY NOT NULL,
+                        source_version bigint NOT NULL,
+                        source_type text NOT NULL,
+                        data jsonb NOT NULL,
+                        metadata jsonb NULL,
+                        created_at timestamp without time zone default (now() at time zone 'utc') NOT NULL
+                    );
+                    """
+
+            override __.Down () =
+                base.Execute
+                    """
+                    DROP TABLE snapshots;
+                    """
