@@ -171,7 +171,7 @@ module Migrations =
                         --  * first `stream_version`
                         --  * last `stream_version`
                         -- Each separated by a comma (e.g. 'stream-12345,1,1,5')
-                        payload := NEW.stream_name || ',' || NEW.stream_id || ',' || (OLD.stream_version + 1) || ',' || NEW.stream_version;
+                        payload := NEW.stream_name || ',' || NEW.stream_id || ',' || (OLD.stream_version) || ',' || NEW.stream_version;
                         -- Notify events to listeners
                         PERFORM pg_notify('events', payload);
                         RETURN NULL;

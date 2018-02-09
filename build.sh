@@ -76,17 +76,6 @@ fi
 
 run $PAKET_EXE restore
 
-if lsof -ti :5432 > /dev/null
-then 
-   echo "postgres already started"
-else 
-  echo "starting postgres"
-  rm -rf data/
-  initdb -D data/
-  postgres -D data &
-  sleep 3  
-#   createdb demo
-fi
 
 POSTGRES_HOST=localhost \
     POSTGRES_USER=$(whoami) \

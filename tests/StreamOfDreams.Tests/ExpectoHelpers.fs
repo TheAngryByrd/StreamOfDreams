@@ -32,3 +32,20 @@ module Expecto =
             | Job(name,test) ->
                 testCaseAsync name <| setup (test >> Job.toAsync)
         )
+[<AutoOpen>]
+module Expect =
+    let throwsTJ<'texn> (f : unit -> Job<unit>) message = job {
+        let! r =  f () |> Job.catch
+        match r with
+        | Choice1Of2 _ ->
+            Tests.failtestf "%s. Expected f to throw." message
+        | Choice2Of2 e when e.GetType() <> typeof<'texn> ->
+            // printfn "%A" e
+            Tests.failtestf "%s. Expected f to throw an exn of type %s, but one of type %s was thrown."
+                        message
+                        (typeof<'texn>.FullName)
+                        (e.GetType().FullName)
+        | Choice2Of2 e ->
+            // printfn "%A" e.StackTrace
+            ()
+    }

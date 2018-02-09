@@ -1,92 +1,7 @@
 namespace StreamOfDreams
 
-[<AutoOpen>]
-module Infrastructure =
-    let (^) x = (<|) x
-
-module Hopac =
-    open Hopac
-    open Hopac.Infixes
-    module Actors =
-        type Actor<'msg> = Mailbox<'msg>
-        type ReplyChannel<'a> = IVar<'a>
-        let actor (body: Actor<'msg> -> Job<unit>) : Job<Mailbox<'msg>> = Job.delay <| fun () ->
-          let mA = Mailbox ()
-          Job.start (body mA) >>-. mA
-
-        let post (mA: Mailbox<'msg>) (m: 'msg) : Job<unit> = mA *<<+ m
-
-        let postAndReply (mA: Mailbox<'msg>) (i2m: ReplyChannel<'r> -> 'msg) : Job<'r> = Job.delay <| fun () ->
-          let i = ReplyChannel ()
-          mA *<<+ i2m i >>=. i
-
-        let reply (rI: ReplyChannel<'r>) (r: 'r) : Job<unit> = rI *<= r
-
-    module Job =
-        let inline usingJob (xJ : Job<'a>) (xJyJ : 'a -> Job<'b>)=
-            xJ
-            |> Job.bind ^ fun dis ->
-                Job.using dis xJyJ
-
-        let inline usingJob' (xJyJ : 'a -> Job<'b>) (xJ : Job<'a>) =
-            usingJob xJ xJyJ
-
-        let inline benchmark name (f : unit -> Job<'a>) = job {
-            let sw = System.Diagnostics.Stopwatch.StartNew()
-            let! result = f ()
-            sw.Stop()
-            printfn "%s took %A ms" name sw.ElapsedMilliseconds
-            return result
-        }
-
-
-module Dictionary =
-    open System.Collections.Generic
-
-    let inline tryGet key (dict : IDictionary<_,_>) =
-        match dict.TryGetValue(key) with
-        | (true,v) -> Some v
-        | _ -> None
-
-    let inline tryFind predicate (dict : IDictionary<_,_>) =
-        dict
-        |> Seq.tryFind(fun kvp -> predicate kvp.Key kvp.Value)
-        |> Option.map(fun kvp -> kvp.Key, kvp.Value)
-
-
-module String =
-    open System
-
-    let inline format template (replacement : obj)=
-        String.Format(template, replacement)
-
-    let inline formatMany template (replacement : obj array)=
-        String.Format(template, replacement)
-
-    let inline join (seperator : string) (strings : string seq) = String.Join(seperator, strings)
-
-    let inline toCamelCase (phrase : string) =
-        let doWork (char : char) (phrase : string) =
-            phrase.Split char
-            |> Seq.map (fun p -> Char.ToLower(p.[0]).ToString() + p.Substring(1))
-            |> join (char.ToString())
-        phrase
-        |> doWork '.'
-        |> doWork '+'
-
-module TypeInfo =
-    open System
-
-    let inline getType obj = obj.GetType()
-    let inline getTypeName (``type`` : Type) = ``type``.Name
-    let inline getTypeFullName (``type`` : Type) = ``type``.FullName
-
-    let inline typeNameToCamelCase obj =
-        obj
-        |> getType
-        |> getTypeName
-        |> String.toCamelCase
-
+open System.Runtime.InteropServices.ComTypes
+open System
 module Json =
     open Newtonsoft.Json
     let inline serialize o =
@@ -109,25 +24,47 @@ module DbHelpers =
     open Npgsql
     open NpgsqlTypes
     open Hopac
+    open System.Threading
 
     let inline builderToConnection (connStr : NpgsqlConnectionStringBuilder) =
         new NpgsqlConnection (connStr |> string)
 
-    let inline ensureOpen (connection : NpgsqlConnection) = job {
+    let inline ensureOpen (connection : NpgsqlConnection) =
         if not <| connection.FullState.HasFlag System.Data.ConnectionState.Open then
-            do! connection.OpenAsync() |> Job.awaitUnitTask
-    }
+            Alt.fromUnitTask (connection.OpenAsync)
+        else
+            Alt.unit()
+
+
+    // let inline createAndOpenConnection (connStr : NpgsqlConnectionStringBuilder) =
+    //     let conn =
+    //         connStr
+    //         |> builderToConnection
+    //     conn
+    //     |> Alt.always
+    //     |> Alt.afterJob ensureOpen
+    //     |> Alt.afterFun(fun _ -> conn)
 
     let inline executeReader (cmd : NpgsqlCommand) =
-        Job.fromTask cmd.ExecuteReaderAsync
+        Alt.fromTask cmd.ExecuteReaderAsync
+        |> Job.map (unbox<NpgsqlDataReader>)
+
+    let inline executeReaderCt (external: CancellationToken) (cmd : NpgsqlCommand) =
+        Alt.fromTask (fun ct ->
+            use cts = CancellationTokenSource.CreateLinkedTokenSource(ct,external)
+            cmd.ExecuteReaderAsync cts.Token)
         |> Job.map (unbox<NpgsqlDataReader>)
 
     let inline executeScalar<'a> (cmd : NpgsqlCommand) =
-        Job.fromTask cmd.ExecuteScalarAsync
-        |> Job.map (unbox<'a>)
+        Alt.fromTask cmd.ExecuteScalarAsync
+        |> Alt.afterFun (unbox<'a>)
 
     let inline executeNonQuery (cmd : NpgsqlCommand) =
-        Job.fromTask cmd.ExecuteNonQueryAsync
+        Alt.fromTask cmd.ExecuteNonQueryAsync
+
+    let inline executeNonQueryIgnore (cmd : NpgsqlCommand) =
+        Alt.fromTask cmd.ExecuteNonQueryAsync
+        |> Alt.afterFun ignore
 
     let inline valueOrDbNull opt =
         match opt with
@@ -280,7 +217,9 @@ module Repository =
             """
             INSERT INTO streams (stream_name)
             VALUES (@streamName)
-            RETURNING stream_id;
+            ON CONFLICT DO NOTHING;
+            SELECT stream_id FROM streams WHERE stream_name = @streamName;
+
             """
         streamName |> textParam "streamName" |> addParameter cmd
         cmd
@@ -450,7 +389,7 @@ module Repository =
     }
 
     //TODO: figureOutLimit
-    let prepareReadFoward conn streamId version limit=
+    let prepareReadFoward conn streamId (version : uint64) (limit : uint64)=
         let cmd = new NpgsqlCommand(Connection = conn)
         cmd.CommandText <-
             """
@@ -469,20 +408,23 @@ module Repository =
             INNER JOIN streams s ON s.stream_id = se.original_stream_id
             INNER JOIN events e ON se.event_id = e.event_id
             WHERE se.stream_id = @streamId and se.stream_version >= @version
-            ORDER BY se.stream_version DESC
+            ORDER BY se.stream_version
             LIMIT @limit
             """
 
         streamId |> inferredParam "streamId" |> addParameter cmd
-        version |> inferredParam "version" |> addParameter cmd
-        limit |> inferredParam "limit" |> addParameter cmd
+        version |> int64 |> inferredParam "version" |> addParameter cmd
+        limit |> int64 |> inferredParam "limit" |> addParameter cmd
         cmd
 
-    let readEventsForward conn (streamName : StreamName) startVersion limit = job {
+    let readEventsForwardInner (forever : bool) token (connStr : NpgsqlConnectionStringBuilder) (streamName : StreamName) (startVersion : uint64) (limit : uint64) = job {
         // let limit = 3000
+
         let getBatch streamId version = job {
+            use conn = connStr |> builderToConnection
+            do! conn |> ensureOpen
             use cmd = prepareReadFoward conn streamId version limit
-            use! reader = cmd |> executeReader
+            use! reader = cmd |> executeReaderCt token
             let! results =
                 reader
                 |> mapRow ^ function
@@ -514,66 +456,40 @@ module Repository =
                         None
             return results
         }
+        use conn = connStr |> builderToConnection
+        do! conn |> ensureOpen
 
         let! streamOpt = getStreamByName conn streamName
+
         match streamOpt with
         | Some s ->
             let xs =
-                Stream.unfoldJob ^ fun (start : int) ->
+                Stream.unfoldJob ^ fun (start : uint64) ->
                     job {
-                        let! retval = getBatch s.Id start
-                        let returnedLength = retval |> Seq.length
-                        if returnedLength = 0 then
+                        if token.IsCancellationRequested then
                             return None
                         else
-                            return Some (retval, (start + limit))
-                }
+                            let! retval = getBatch s.Id start
+                            let returnedLength = retval |> Seq.length
+                            if returnedLength = 0 then
+                                if forever then
+                                    do! timeOutMillis 25
+                                    return Some ([], (start))
+                                else
+                                    return None
+                            else
+                                return Some (retval, (start + uint64 returnedLength))
+                    }
+
+                // >> Stream.doFinalizeFun (fun _ -> token.)
             return Some (xs startVersion |> Stream.appendMap (Stream.ofSeq))
         | None ->
             return None
-
-        // let! streamOpt = getStreamByName conn streamName
-        // return!
-        //     match streamOpt with
-        //     | Some s -> job {
-        //         use cmd = prepareReadFoward conn s.Id startVersion
-        //         let! reader = cmd |> executeReader
-        //         let! results =
-        //             reader
-        //             |> mapRow ^ function
-        //                 | [ "stream_version", Some streamVersion
-        //                     "event_id", Some eventId
-        //                     "stream_name", Some streamName
-        //                     "original_stream_version", Some originalVersion
-        //                     "event_type", Some eventType
-        //                     "correlation_id", correlation
-        //                     "causation_id", causatoin
-        //                     "data", Some data
-        //                     "metadata", metadata
-        //                     "created_at", Some createdAt ]
-        //                         -> Some <|
-        //                             {
-        //                                 Id =  eventId |> unbox<Guid>
-        //                                 Number = originalVersion |> unbox<int64> |> uint64
-        //                                 StreamName =  streamName |> unbox<string>
-        //                                 StreamVersion = originalVersion |> unbox<int64> |> uint64
-        //                                 CorrelationId= correlation |> unbox<Guid option>
-        //                                 CausationId = causatoin |> unbox<Guid option>
-        //                                 EventType=  eventType |> unbox<string>
-        //                                 Data = data |> unbox<string>
-        //                                 Metadata=  metadata |> unbox<string option>
-        //                                 CreatedAt = createdAt |> unbox<DateTime>
-
-        //                             }
-        //                 | _ ->
-        //                    // printfn "%A" f
-        //                     None
-        //         return Some results
-        //         }
-        //     | None ->
-        //         //TODO: Result Type
-        //         None |> Job.result
     }
+
+    let readEventsForwardForever = readEventsForwardInner true
+
+    let readEventsForward = readEventsForwardInner false
 
 
 
@@ -652,8 +568,9 @@ module Commands =
         EventIds : Guid list
         NextExpectedVersion : uint64
     }
+    exception ConcurrencyException of string
 
-    let internal appendToStream' (connStr : NpgsqlConnectionStringBuilder) streamName version events = job {
+    let appendToStream' (connStr : NpgsqlConnectionStringBuilder) streamName version events = job {
         use conn = builderToConnection connStr
         do! conn |> ensureOpen
         use transaction = conn.BeginTransaction()
@@ -669,76 +586,167 @@ module Commands =
             |> Job.map Option.get
         let! stream =
             // https://eventstore.org/docs/dotnet-api/4.0.2/optimistic-concurrency-and-idempotence/
-            //TODO: Result type!
+            //TODO: Result type?
             match streamOpt, version with
             | Some stream, Any ->
                 stream |> Job.result
             | None, Any ->
                 createStream ()
             | Some _, NoStream ->
-                failwithf "Concurrency error. Expected no stream but was stream"
+                streamName |> sprintf "Expected stream %s to not have been created yet. " |> ConcurrencyException |> raise
             | None , NoStream ->
                 createStream ()
             | Some stream, StreamExists ->
                 stream |> Job.result
             | None , StreamExists ->
-                failwithf "Concurrency error. Expected stream but was no stream"
+                streamName |> sprintf "Expected stream %s to have already been created. " |> ConcurrencyException |> raise
+            | Some stream, EmptyStream when stream.Version <> 0UL ->
+                (streamName,stream.Version) ||> sprintf "Stream %s expected to be at version 0 but at %d" |> ConcurrencyException |> raise
             | Some stream, EmptyStream ->
-                if stream.Version <> 0UL then
-                    failwithf "Concurrency error. Stream expected to be 0 but at %A" stream.Version
                 stream |> Job.result
             | None, EmptyStream ->
-                failwith "Concurrency error. Stream expected to be created but has not"
+                streamName |> sprintf "Stream %s expected to have been created but was not" |> ConcurrencyException |> raise
             | Some stream, Value version when stream.Version = version ->
                 stream |> Job.result
             | Some stream, Value version ->
-                failwithf "Concurrency error. Stream expected to be %d but at %d" version stream.Version
+                sprintf "Stream %s expected to be at version %d but at %d" streamName version stream.Version |> ConcurrencyException |> raise
             | None, Value _ ->
-                failwith "Concurrency error. Stream expected to be created but has not"
+                //TODO: Should 0 create the stream?
+                sprintf "Expected stream %s to have been created." streamName  |> ConcurrencyException |> raise
 
+        let! savedEvents = Repository.insertEvents conn events
+        use cmd = Repository.prepareCreateStreamEvents conn stream.Id (savedEvents)
+        let! nextExpectedVersion = cmd |> executeScalar<int64>
 
+        use cmd = Repository.prepareLinkEvents conn AllStreamId (savedEvents)
+        do! cmd |> executeNonQuery |> Job.Ignore
 
-        let! savedEvents =
-           // Job.benchmark "insertEvents" ^ fun () ->
-                Repository.insertEvents conn events
-
-
-        let! nextExpectedVersion =
-            let foo = Repository.prepareCreateStreamEvents conn stream.Id (savedEvents)
-            //Job.benchmark "prepareCreateStreamEvents" ^ fun _ ->
-            foo |> executeScalar<int64>
-        let! result =
-            let foo = Repository.prepareLinkEvents conn AllStreamId (savedEvents)
-            //Job.benchmark "prepareLinkEvents" ^ fun _ ->
-            foo |> executeNonQuery
-        do! transaction.CommitAsync() |> Job.awaitUnitTask
+        do! transaction.CommitAsync()
+            |> Job.awaitUnitTask
 
         return {
             NextExpectedVersion = nextExpectedVersion |> uint64
             EventIds = savedEvents
         }
-
-
     }
     open Hopac.Infixes
     type Msg =
-    | AppendToStream of DomainTypes.StreamName*Version*DbTypes.RecordedEvent array*Actors.ReplyChannel<AppendResult>
+    | AppendToStream of DomainTypes.StreamName*Version*DbTypes.RecordedEvent array*Actors.ReplyChannel<Choice<AppendResult,exn>>
 
+    //TODO make singleton
     let create connectionString =
         Actors.actor <|
             fun mb -> Job.foreverServer (Mailbox.take mb >>= function
                 | AppendToStream(name,version,events, reply) -> job {
-                    let! result = appendToStream' connectionString name version events
+                    let! result = appendToStream' connectionString name version events |> Job.catch
                     do! Actors.reply reply result
                 }
             )
 
     let appendToStream name version events actor=
         Actors.postAndReply actor (fun i -> AppendToStream(name,version,events,i))
+        |> Job.map ^ function
+            | Choice1Of2 r -> r
+            | Choice2Of2 ex ->
+                Ex.throwPreserve ex
 
 
 
+module Subscriptions =
+    open DbHelpers
+    open System
+    open System.Linq
+    open Hopac
+    open Npgsql
+    open System.Threading
+    // initial -> subscribe_to_events -> request_catch_up -> catching_up -> subscribed
 
+    type SubscriptionState =
+    | Initial
+    | SubscribeToEvents
+    | RequestCatchUp
+    | Catchup
+    | Subscribed
+
+    type Notification = {
+        StreamName : string
+        StreamId : uint64
+        FirstWriteVersion: uint64
+        LastWriteVersion: uint64
+    }
+    with
+        static member parse (notification : string) =
+
+            let parts =
+                notification
+                |> String.reverse
+                |> String.splitByCharMax ',' 4
+                |> Array.map (String.reverse)
+            {
+                StreamName = parts.[3]
+                StreamId   = parts.[2] |> uint64
+                FirstWriteVersion = parts.[1] |> uint64
+                LastWriteVersion = parts.[0] |> uint64
+            }
+
+    let startNotify (ct : CancellationToken) connStr = job {
+            // -- Payload text contains:
+            //             --  * `stream_name`
+            //             --  * `stream_id`
+            //             --  * first `stream_version`
+            //             --  * last `stream_version`
+            //             -- Each separated by a comma (e.g. 'stream-12345,1,1,5')
+        let connStr = NpgsqlConnectionStringBuilder(connStr |> string , KeepAlive = 30)
+        let output = Stream.Src.create<NpgsqlNotificationEventArgs>()
+        let conn = builderToConnection connStr
+        do! ensureOpen conn
+        use cmd = new NpgsqlCommand(sprintf "LISTEN \"%s\"" "events", conn)
+        do! cmd |> executeNonQueryIgnore
+
+        let notificationSub =
+            conn.Notification.Subscribe (Stream.Src.value output >> start)
+
+        job {
+            let cleanup = job {
+                // Wait for connection to real stop fetching before closing
+                //https://github.com/npgsql/npgsql/issues/1638#issuecomment-357933587
+                let rec spinWaitConnectionFinished count i = job {
+                    if count = i
+                       || (conn.FullState.HasFlag(System.Data.ConnectionState.Fetching) |> not) then
+                        ()
+                    else
+                        do! timeOutMillis (i * 10)
+                        return! spinWaitConnectionFinished count (i + 1)
+                }
+                notificationSub.Dispose()
+                do! spinWaitConnectionFinished 50 0
+                conn.Dispose()
+                do! Stream.Src.close output
+            }
+            // need to loop forever to get notifications
+            // https://github.com/npgsql/npgsql/issues/1024
+            while ct.IsCancellationRequested |> not do
+                    try
+                        do! conn.WaitAsync(ct) |> Job.awaitUnitTask
+                    with
+                    | null ->
+                        // TODO: Chase down null exeception
+                        // Somehow hopac or npgsql throws a null exception, not a nullreference exception
+                        // It might be an interaction of how npgsql cancels it's operation
+                        // and hopac handles cancelled tasks
+                        ()
+                    | e ->
+                        do! cleanup
+                        Ex.throwCapture e
+            do! cleanup
+            return! Job.abort()
+        }
+        |> server
+
+        return output
+               |> Stream.Src.tap
+               |> Stream.mapFun(fun arg -> Notification.parse arg.AdditionalInformation)
+    }
 // module Fooy =
 //     open System
 //     open System.Collections.Generic

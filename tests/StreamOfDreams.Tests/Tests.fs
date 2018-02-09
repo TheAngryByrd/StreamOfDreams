@@ -5,6 +5,7 @@ open System
 open Expecto
 // open Expecto.BenchmarkDotNet
 open StreamOfDreams
+open StreamOfDreams.DbHelpers
 open Npgsql
 open System.Threading
 open System.Data
@@ -21,9 +22,52 @@ open System.Security.Cryptography
 open Expecto.Logging
 open Expecto.Logging
 open Hopac.Extensions
+open StreamOfDreams
+open System.Xml
 
 module All =
     let (^) f x = f x
+
+
+    module HopacActors =
+
+        let tests =
+            testList "BounbdedAckMB" [
+                testCaseJob "Playground" <| job {
+                    let! boundedAckMb = BoundedAckingMb.create 5
+                    do! BoundedAckingMb.put boundedAckMb "Hello1"
+                    do! BoundedAckingMb.put boundedAckMb "Hello2"
+                    do! BoundedAckingMb.put boundedAckMb "Hello3"
+                    do! BoundedAckingMb.put boundedAckMb "Hello4"
+                    // Should be free to take one
+                    let! result = BoundedAckingMb.take boundedAckMb
+                    Expect.equal result "Hello1" "Not Hello1"
+                    // now it's locked so we shouldn't get new value until we ack
+                    let! result =
+                        Alt.choose [
+                            timeOutMillis 100 |> Alt.afterFun (fun _ -> "nope")
+                            BoundedAckingMb.take boundedAckMb
+                        ]
+
+                    Expect.equal result "nope" "Not Hello1"
+                    do! BoundedAckingMb.ack boundedAckMb
+                    // Should be free
+                    let! result = BoundedAckingMb.take boundedAckMb
+                    Expect.equal result "Hello2" "Not Hello2"
+                    // Now we need to nack again but we should be able to fill more in
+                    do! BoundedAckingMb.put boundedAckMb "Hello5"
+                    BoundedAckingMb.put boundedAckMb "Hello5" |> start
+                    BoundedAckingMb.put boundedAckMb "Hello5" |> start
+                    BoundedAckingMb.put boundedAckMb "Hello5" |> start
+
+                    do! BoundedAckingMb.ack boundedAckMb
+
+                    let! result = BoundedAckingMb.takeAndAck boundedAckMb
+
+                    Expect.equal result "Hello3" "Not Hello2"
+                    return ()
+                }
+            ]
 
     // module Task =
 
@@ -387,7 +431,36 @@ module All =
     let commandTest =
         testList "Command tests" [
             yield! testFixtureAsync withMigratedDatabase [
-                testCaseJob' "Append test" <| fun db -> job {
+                testCaseJob' "Append many to single stream" <| fun db -> job {
+                    let connStr = helpfulConnStrAddtions db.Conn
+                    let! writer = Commands.create connStr
+                    use connection = new NpgsqlConnection(connStr |> string)
+                    do! connection |> ensureOpen
+                    let streamName = "Bank-12456"
+                    let eventsToGenerate = 13
+                    let! writeResult =
+                        let events = generatePeopleEvents eventsToGenerate |> Seq.toArray
+                        Commands.appendToStream (streamName) DomainTypes.Version.Any events writer
+
+                    Expect.equal writeResult.NextExpectedVersion (uint64 eventsToGenerate) "Not expected Version"
+
+                    let! allStream = Repository.getStreamByName connection "$all" |> Job.map Option.get
+                    Expect.equal allStream.Version (uint64 eventsToGenerate) "Not expected Version"
+
+                    let! stream = Repository.getStreamByName connection (streamName) |> Job.map Option.get
+                    Expect.equal stream.Version (uint64 eventsToGenerate) "Not expected Version"
+                    use cts = new Threading.CancellationTokenSource()
+                    let! events =
+                         Repository.readEventsForward cts.Token connStr streamName 0UL 10000UL
+                         |> Job.map Option.get
+
+                    let! length =
+                            events
+                            |> Stream.foldFun (fun x s -> x + 1) 0
+                    Expect.equal length (eventsToGenerate) "Events not written to stream"
+                    cts.Cancel()
+                }
+                testCaseJob' "Read forever" <| fun db -> job {
                     let connStr = helpfulConnStrAddtions db.Conn
                     let! writer = Commands.create connStr
                     use connection = new NpgsqlConnection(connStr |> string)
@@ -406,17 +479,244 @@ module All =
                     let! stream = Repository.getStreamByName connection (streamName) |> Job.map Option.get
                     Expect.equal stream.Version (uint64 eventsToGenerate) "Not expected Version"
 
+
+                    use cts = new Threading.CancellationTokenSource()
+
                     let! events =
-                         Repository.readEventsForward connection streamName 0 10000
+                         Repository.readEventsForwardForever cts.Token connStr streamName 0UL 10000UL
                          |> Job.map Option.get
+                    let mutable length = 0UL
+                    let sema =  new SemaphoreSlim(0)
+                    events
+                    |> Stream.iterJob(fun _ -> job {
+                        length <- length + 1UL
+                        if length = writeResult.NextExpectedVersion then
+                            sema.Release() |>ignore
+                            return! Job.abort()
+                    })
+                    |> start
+                    do! sema.WaitAsync() |> Job.awaitUnitTask
+                    Expect.equal length ((writeResult.NextExpectedVersion)) "Events not written to stream"
+                    let nextGen = 1000
+                    let! writeResult =
+                        let events = generatePeopleEvents nextGen |> Seq.toArray
+                        Commands.appendToStream (streamName) DomainTypes.Version.Any events writer
+                    events
+                    |> Stream.iterJob(fun _ -> job {
+                        length <- length + 1UL
+                        if length = writeResult.NextExpectedVersion then
+                            sema.Release() |>ignore
+                            return! Job.abort()
+                    })
+                    |> start
+                    do! sema.WaitAsync() |> Job.awaitUnitTask
+                    Expect.equal (length) (writeResult.NextExpectedVersion) "Events not written to stream"
+                    cts.Cancel()
+                }
 
-                    let! length =
-                          Job.benchmark "readEventsForwardReal" ^ fun _ ->
-                            events
-                            |> Stream.foldFun (fun x s -> x + 1) 0
-                    Expect.equal length (eventsToGenerate) "Events not written to stream"
+                testCaseJob' "Stream exists, should fail with NoStream set" <| fun db -> job {
+                    let connStr = helpfulConnStrAddtions db.Conn
+                    let! writer = Commands.create connStr
+                    use connection = new NpgsqlConnection(connStr |> string)
+                    do! connection |> ensureOpen
+                    let streamName = "Bank-124562"
+
+                    let! _ = Repository.prepareCreateStream  connection streamName |> executeNonQuery
+                    let events = generatePeopleEvents 1 |> Seq.toArray
+                    do! Expect.throwsTJ<Commands.ConcurrencyException> (fun () ->Commands.appendToStream streamName DomainTypes.Version.NoStream events writer |> Job.Ignore ) "Should throw concurreny exception"
+                    ()
+                }
+                testCaseJob' "Stream doesnt exist, should fail with StreamExists set" <| fun db -> job {
+                    let connStr = helpfulConnStrAddtions db.Conn
+                    let! writer = Commands.create connStr
+                    use connection = new NpgsqlConnection(connStr |> string)
+                    do! connection |> ensureOpen
+                    let streamName = "Bank-124562"
+
+                    let events = generatePeopleEvents 1 |> Seq.toArray
+                    do! Expect.throwsTJ<Commands.ConcurrencyException> (fun () ->Commands.appendToStream streamName DomainTypes.Version.StreamExists events writer |> Job.Ignore ) "Should throw concurreny exception"
+                    ()
+                }
+                testCaseJob' "Stream exist with items already, should fail with EmptyStream set" <| fun db -> job {
+                    let connStr = helpfulConnStrAddtions db.Conn
+                    let! writer = Commands.create connStr
+                    use connection = new NpgsqlConnection(connStr |> string)
+                    do! connection |> ensureOpen
+                    let streamName = "Bank-124562"
+
+                    let events = generatePeopleEvents 1 |> Seq.toArray
+                    do! Commands.appendToStream streamName DomainTypes.Version.Any events writer |> Job.Ignore
+
+                    let events = generatePeopleEvents 1 |> Seq.toArray
+                    do! Expect.throwsTJ<Commands.ConcurrencyException> (fun () ->Commands.appendToStream streamName DomainTypes.Version.EmptyStream events writer |> Job.Ignore ) "Should throw concurreny exception"
+                    ()
+                }
+                testCaseJob' "Stream doesn't exist, should fail with EmptyStream set" <| fun db -> job {
+                    let connStr = helpfulConnStrAddtions db.Conn
+                    let! writer = Commands.create connStr
+                    use connection = new NpgsqlConnection(connStr |> string)
+                    do! connection |> ensureOpen
+                    let streamName = "Bank-124562"
+
+                    let events = generatePeopleEvents 1 |> Seq.toArray
+                    do! Expect.throwsTJ<Commands.ConcurrencyException> (fun () ->Commands.appendToStream streamName DomainTypes.Version.EmptyStream events writer |> Job.Ignore ) "Should throw concurreny exception"
+                    ()
+                }
+                testCaseJob' "Stream exists with another version, should fail with Version value set to another number" <| fun db -> job {
+                    let connStr = helpfulConnStrAddtions db.Conn
+                    let! writer = Commands.create connStr
+                    use connection = new NpgsqlConnection(connStr |> string)
+                    do! connection |> ensureOpen
+                    let streamName = "Bank-124562"
+
+                    let events = generatePeopleEvents 3 |> Seq.toArray
+                    do! Commands.appendToStream streamName DomainTypes.Version.Any events writer |> Job.Ignore
+
+                    let events = generatePeopleEvents 1 |> Seq.toArray
+                    do! Expect.throwsTJ<Commands.ConcurrencyException> (fun () ->Commands.appendToStream streamName (DomainTypes.Version.Value 1UL) events writer |> Job.Ignore ) "Should throw concurreny exception"
+                    ()
+                }
+                testCaseJob' "Stream doesnt exist, should fail with Version value set to number" <| fun db -> job {
+                    let connStr = helpfulConnStrAddtions db.Conn
+                    let! writer = Commands.create connStr
+                    use connection = new NpgsqlConnection(connStr |> string)
+                    do! connection |> ensureOpen
+                    let streamName = "Bank-124562"
+
+                    let events = generatePeopleEvents 1 |> Seq.toArray
+                    do! Expect.throwsTJ<Commands.ConcurrencyException> (fun () ->Commands.appendToStream streamName (DomainTypes.Version.Value 1UL) events writer |> Job.Ignore ) "Should throw concurreny exception"
+                    ()
+                }
+            ]
+        ]
+
+    let createByEventType eventType = String.format "$et-{0}" eventType
+    let eventTypeProjection ct connStr = job {
+
+        let! notifications = StreamOfDreams.Subscriptions.startNotify ct connStr
+        notifications
+        |> Stream.filterFun(fun n -> n.StreamName = "$all")
+        |> Stream.takeUntil (Alt.ctToAlt (TimeSpan.FromMilliseconds(100.)) ct)
+        |> Stream.iterJob (fun notification -> job {
+            let diff  = (notification.LastWriteVersion - notification.FirstWriteVersion)
+            let! events =
+                StreamOfDreams.Repository.readEventsForward ct connStr notification.StreamName (notification.FirstWriteVersion ) diff
+                |> Job.map Option.get
+                |> Job.map (Stream.take (int64 diff))
+                |> Job.bind(Stream.toSeq)
+            // printfn "%A" notification
+            // printfn "%A" events
+            use conn = builderToConnection connStr
+            do! ensureOpen conn
+            do!
+                    events
+                    |> Seq.groupBy(fun e -> e.EventType)
+                    |> Seq.map(fun (e, xs) -> job {
+
+                        let streamName = createByEventType e
+                        use createStream = Repository.prepareCreateStream conn streamName
+                        let! streamId = createStream |> executeScalar<int64>
 
 
+                        use linkEt =
+                            xs
+                            |> Seq.map(fun e -> e.Id)
+                            |> Repository.prepareLinkEvents conn streamId
+                        do! linkEt |> executeNonQueryIgnore
+
+                    })
+                    |> Job.seqIgnore
+            // printfn "%A" events
+        })
+        |> start
+        ()
+    }
+
+    let notifyTests =
+        testList "Notify tests" [
+            yield testCase "Can parse normal notification string" <| fun () ->
+                let notificationStr = "Bank-124562,1,1,3"
+                let (expected : Subscriptions.Notification) = {
+                    StreamName = "Bank-124562"
+                    StreamId   = 1UL
+                    FirstWriteVersion = 1UL
+                    LastWriteVersion = 3UL
+                }
+                let actual =  Subscriptions.Notification.parse notificationStr
+                Expect.equal actual expected "Didn't parse notification event correctly"
+            yield testCase "Can parse devious notification string" <| fun () ->
+                let notificationStr = "Bank,124562,1,1,3"
+                let (expected : Subscriptions.Notification) = {
+                    StreamName = "Bank,124562"
+                    StreamId   = 1UL
+                    FirstWriteVersion = 1UL
+                    LastWriteVersion = 3UL
+                }
+                let actual =  Subscriptions.Notification.parse notificationStr
+                Expect.equal actual expected "Didn't parse notification event correctly"
+
+            yield! testFixtureAsync withMigratedDatabase [
+                testCaseJob' "Foo" <| fun db -> job {
+                    use cts = new CancellationTokenSource()
+                    // let foo = db.Conn
+                    let! notificationChannel = StreamOfDreams.Subscriptions.startNotify cts.Token db.Conn
+                    let! writer = Commands.create db.Conn
+                    use connection = builderToConnection db.Conn
+                    do! connection |> ensureOpen
+                    let streamName = "Bank-124562"
+                    let eventCount = 3
+                    let events = generatePeopleEvents eventCount |> Seq.toArray
+                    do! Commands.appendToStream streamName DomainTypes.Version.Any events writer
+                        |> Job.Ignore
+
+                    let! promise =
+                        notificationChannel
+                        |> Stream.toSeq
+                        |> Promise.start
+
+                    do! Commands.appendToStream streamName DomainTypes.Version.Any events writer
+                        |> Job.Ignore
+                    let expected =
+                        [
+                            "Bank-124562,1,0,3"
+                            "$all,0,0,3"
+                            "Bank-124562,1,3,6"
+                            "$all,0,3,6"
+                        ]
+                        |> Seq.map Subscriptions.Notification.parse
+
+                    cts.Cancel()
+                    let! result = promise
+                    Expect.sequenceEqual result expected "Did not receive notification events in order"
+                }
+                testCaseJob' "foo2" <| fun db -> job {
+                    use cts = new CancellationTokenSource()
+                    use conn = db.Conn |> builderToConnection
+                    do! ensureOpen conn
+                    do! eventTypeProjection cts.Token db.Conn
+                    let streamName = "Bank-124562"
+                    let eventCount = 1000
+                    let! writer = Commands.create db.Conn
+                    let events = generatePeopleEvents eventCount |> Seq.toArray
+
+                    let upTo = 200
+                    do! [1..upTo]
+                        |> Seq.map (fun _ ->
+                            Commands.appendToStream streamName DomainTypes.Version.Any events writer |> Job.Ignore)
+                        |> Job.seqIgnore
+                    // printfn "%A" events
+                    // do!
+                    // do! Commands.appendToStream streamName DomainTypes.Version.Any events writer
+                    //     |> Job.Ignore
+
+                    do! timeOutMillis 1000
+
+                    let! stream =
+                        Repository.getStreamByName conn streamName
+                        |> Job.map Option.get
+                    printfn "%A" stream
+                    Expect.equal stream.Version (uint64 eventCount * uint64 upTo) "Not same"
+                    cts.Cancel()
                 }
             ]
         ]
@@ -441,5 +741,7 @@ module All =
                 yield eventTableTests
                 yield streamTableTests
                 yield commandTest
+                yield HopacActors.tests
+                yield notifyTests
                 // yield CommandPerfTest
             ]

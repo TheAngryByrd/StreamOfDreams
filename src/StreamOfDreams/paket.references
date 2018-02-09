@@ -1,10 +1,9 @@
 Microsoft.DotNet.Watcher.Tools
 dotnet-mono
+
 fsharp.core
 SourceLink.Create.CommandLine
 npgsql
 Hopac
 Newtonsoft.Json
-System.Reactive
-Giraffe.Tasks
 Simple.Migrations

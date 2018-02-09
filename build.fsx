@@ -1,10 +1,15 @@
 #r @"packages/build/FAKE/tools/FakeLib.dll"
+
+#load "./lib/build/ProcessHelper.fsx"
+
 open Fake
 open Fake.Git
 open Fake.AssemblyInfoFile
 open Fake.ReleaseNotesHelper
 open Fake.UserInputHelper
 open System
+open BDS.BuildTools
+open BDS.BuildTools.ProcessHelper
 
 let release = LoadReleaseNotes "RELEASE_NOTES.md"
 
@@ -70,7 +75,7 @@ let getTargetFrameworksFromProjectFile (projFile : string)=
     |> Seq.toList
 
 let selectRunnerForFramework tf =
-    let runMono = sprintf "mono -f %s -c Release"
+    let runMono = sprintf "mono -f %s -c Release --loggerlevel Warn"
     let runCore = sprintf "run -f %s -c Release"
     match tf with
     | Full t when isMono-> runMono t
@@ -124,12 +129,6 @@ Target "WatchTests" (fun _ ->
     printfn "Press enter to stop..."
     Console.ReadLine() |> ignore
 
-    if isWindows |> not then
-        startedProcesses
-        |> Seq.iter(fst >> killParentsAndChildren >> ignore )
-    else
-        //Hope windows handles this right?
-        ()
 )
 
 Target "DotnetPack" ^ fun _ ->
@@ -167,6 +166,14 @@ Target "Release" ^ fun _ ->
 
     Branches.tag "" release.NugetVersion
     Branches.pushTag "" "origin" release.NugetVersion
+
+
+FinalTarget "KillStarted" <| fun _ ->
+    Fake.ProcessHelper.startedProcesses
+    |> Seq.map fst
+    |> Seq.iter(killChildrenAndProcess (TimeSpan.FromSeconds(20.)))
+
+ActivateFinalTarget "KillStarted"
 
 // "Clean"
 //   ==> "DotnetRestore"

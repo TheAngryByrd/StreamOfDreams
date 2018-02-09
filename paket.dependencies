@@ -10,8 +10,7 @@ nuget SourceLink.Create.CommandLine copy_local: true
 nuget Expecto
 nuget Expecto.BenchmarkDotNet
 nuget Hopac
-nuget System.Reactive
-nuget Giraffe.Tasks 0.1.0-beta-010 beta
+
 
 group Build
     framework: net462
