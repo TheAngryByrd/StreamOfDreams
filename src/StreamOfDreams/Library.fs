@@ -1,7 +1,6 @@
 namespace StreamOfDreams
 
-open System.Runtime.InteropServices.ComTypes
-open System
+
 module Json =
     open Newtonsoft.Json
     let inline serialize o =
@@ -10,6 +9,8 @@ module Json =
         JsonConvert.DeserializeObject<'a> o
 
 module DomainTypes =
+    open System
+    type EventId = Guid
     type StreamName = string
 
     type Version =
@@ -17,6 +18,14 @@ module DomainTypes =
     | NoStream
     | StreamExists
     | Any
+    | Value of uint64
+
+    type SubscriptionPosition =
+    /// Always subscribe from the begining.  Same as `Value 0`. Only use if you want to always start from the beginning.
+    | Beginning
+    /// Use what was persisted last in the database.  This useful for processors that want to start from where they left off.
+    | Continue
+    /// Use a discrete value.  Useful for if you know exactly where you want to start.  Should not be used for long running processes.
     | Value of uint64
 
 module DbHelpers =
@@ -330,30 +339,34 @@ module Repository =
                         stream AS (
                           UPDATE streams SET stream_version = stream_version + @eventCount
                           WHERE stream_id = @streamId
-                          RETURNING stream_version - @eventCount as initial_stream_version
+                          RETURNING stream_version - @eventCount as initial_stream_version, stream_version AS next_expected_version
                         ),
                         events (index, event_id) AS (
                           VALUES {0}
+                        ),
+                        ignoring as (
+                          INSERT INTO stream_events
+                            (
+                              stream_id,
+                              stream_version,
+                              event_id,
+                              original_stream_id,
+                              original_stream_version
+                            )
+                          SELECT
+                            @streamId,
+                            stream.initial_stream_version + events.index,
+                            events.event_id,
+                            original_stream_events.original_stream_id,
+                            original_stream_events.stream_version
+                          FROM events
+                          CROSS JOIN stream
+                          INNER JOIN stream_events as original_stream_events
+                            ON original_stream_events.event_id = events.event_id
+                              AND original_stream_events.stream_id = original_stream_events.original_stream_id
                         )
-                      INSERT INTO stream_events
-                        (
-                          stream_id,
-                          stream_version,
-                          event_id,
-                          original_stream_id,
-                          original_stream_version
-                        )
-                      SELECT
-                        @streamId,
-                        stream.initial_stream_version + events.index,
-                        events.event_id,
-                        original_stream_events.original_stream_id,
-                        original_stream_events.stream_version
-                      FROM events
-                      CROSS JOIN stream
-                      INNER JOIN stream_events as original_stream_events
-                        ON original_stream_events.event_id = events.event_id
-                          AND original_stream_events.stream_id = original_stream_events.original_stream_id;
+
+                      SELECT stream.next_expected_version FROM stream;
                       """
 
         streamId |> inferredParam "streamId" |> addParameter cmd
@@ -565,26 +578,21 @@ module Commands =
     let AllStreamId = 0
 
     type AppendResult = {
-        EventIds : Guid list
+        EventIds : Guid seq
         NextExpectedVersion : uint64
     }
     exception ConcurrencyException of string
 
-    let appendToStream' (connStr : NpgsqlConnectionStringBuilder) streamName version events = job {
-        use conn = builderToConnection connStr
-        do! conn |> ensureOpen
-        use transaction = conn.BeginTransaction()
-
+    let internal concurrencyCheck conn streamName version = job {
         let! streamOpt = //Job.benchmark "getStreamByName" ^ fun () ->
-                            Repository.getStreamByName conn streamName
-
+                    Repository.getStreamByName conn streamName
         let createStream () =
             Repository.prepareCreateStream conn streamName
             |> DbHelpers.executeNonQuery
             |> Job.bind ^ fun _ ->
                 Repository.getStreamByName conn streamName
             |> Job.map Option.get
-        let! stream =
+        return!
             // https://eventstore.org/docs/dotnet-api/4.0.2/optimistic-concurrency-and-idempotence/
             //TODO: Result type?
             match streamOpt, version with
@@ -606,20 +614,32 @@ module Commands =
                 stream |> Job.result
             | None, EmptyStream ->
                 streamName |> sprintf "Stream %s expected to have been created but was not" |> ConcurrencyException |> raise
-            | Some stream, Value version when stream.Version = version ->
+            | Some stream, Version.Value version when stream.Version = version ->
                 stream |> Job.result
-            | Some stream, Value version ->
+            | Some stream, Version.Value version ->
                 sprintf "Stream %s expected to be at version %d but at %d" streamName version stream.Version |> ConcurrencyException |> raise
-            | None, Value _ ->
-                //TODO: Should 0 create the stream?
+            | None, Version.Value 0UL ->
+                createStream ()
+            | None, Version.Value _ ->
                 sprintf "Expected stream %s to have been created." streamName  |> ConcurrencyException |> raise
+
+    }
+
+
+    let appendToStream' (connStr : NpgsqlConnectionStringBuilder) streamName (version : Version) events = job {
+        use conn = builderToConnection connStr
+        do! conn |> ensureOpen
+        use transaction = conn.BeginTransaction()
+
+        let! stream = concurrencyCheck conn streamName version
+
 
         let! savedEvents = Repository.insertEvents conn events
         use cmd = Repository.prepareCreateStreamEvents conn stream.Id (savedEvents)
         let! nextExpectedVersion = cmd |> executeScalar<int64>
 
         use cmd = Repository.prepareLinkEvents conn AllStreamId (savedEvents)
-        do! cmd |> executeNonQuery |> Job.Ignore
+        do! cmd |> executeNonQueryIgnore
 
         do! transaction.CommitAsync()
             |> Job.awaitUnitTask
@@ -629,22 +649,55 @@ module Commands =
             EventIds = savedEvents
         }
     }
+    let linkToStream' (connStr : NpgsqlConnectionStringBuilder) streamName (version : Version) eventIds = job {
+        use conn = builderToConnection connStr
+        do! conn |> ensureOpen
+        use transaction = conn.BeginTransaction()
+
+        let! stream = concurrencyCheck conn streamName version
+
+        use cmd = Repository.prepareLinkEvents conn stream.Id (eventIds)
+        let! nextExpectedVersion = cmd |> executeScalar<int64>
+
+        do! transaction.CommitAsync()
+            |> Job.awaitUnitTask
+
+        return {
+            NextExpectedVersion = nextExpectedVersion |> uint64
+            EventIds = eventIds
+        }
+    }
+
     open Hopac.Infixes
     type Msg =
     | AppendToStream of DomainTypes.StreamName*Version*DbTypes.RecordedEvent array*Actors.ReplyChannel<Choice<AppendResult,exn>>
+    | LinkToStream of StreamName*Version*seq<EventId>*Actors.ReplyChannel<Choice<AppendResult,exn>>
 
     //TODO make singleton
     let create connectionString =
         Actors.actor <|
             fun mb -> Job.foreverServer (Mailbox.take mb >>= function
-                | AppendToStream(name,version,events, reply) -> job {
-                    let! result = appendToStream' connectionString name version events |> Job.catch
-                    do! Actors.reply reply result
-                }
+                | AppendToStream(name,version,events, reply) ->
+                    job {
+                        let! result = appendToStream' connectionString name version events |> Job.catch
+                        do! Actors.reply reply result
+                    }
+                | LinkToStream(name,version,eventIds, reply) ->
+                    job {
+                        let! result = linkToStream' connectionString name version eventIds |> Job.catch
+                        do! Actors.reply reply result
+                    }
             )
 
     let appendToStream name version events actor=
         Actors.postAndReply actor (fun i -> AppendToStream(name,version,events,i))
+        |> Job.map ^ function
+            | Choice1Of2 r -> r
+            | Choice2Of2 ex ->
+                Ex.throwPreserve ex
+
+    let linkToStream (name : StreamName) (version : Version) ( eventIds : EventId seq) actor =
+        Actors.postAndReply actor (fun i -> LinkToStream(name,version,eventIds,i))
         |> Job.map ^ function
             | Choice1Of2 r -> r
             | Choice2Of2 ex ->
@@ -854,3 +907,69 @@ module Subscriptions =
 
 //     let hello name =
 //         sprintf "Hello %s" name
+
+module Eventstore =
+    open System
+    open Npgsql
+    open System.Threading
+    open Hopac
+    open DomainTypes
+
+    type Projection<'a> =
+    // Typically used to build a read model from a stream.  This readmodel in theory should be able to be rebuilt.
+    | ReadModel of (DbTypes.RecordedEvent -> Job<'a>)
+    // Typically used for side effects for a stream, like linking events to another stream or send emails.  This typically is not something you can easy undo.
+    | PartitionTo of (DbTypes.RecordedEvent -> Job<unit>)
+
+    type Ack = IVar<unit>
+
+    type Eventstore(connString : NpgsqlConnectionStringBuilder, writer) =
+
+        let cts = new CancellationTokenSource()
+        let appendToStream streamName version events  =
+            Commands.appendToStream streamName version events  writer
+        let linkToStream streamName version eventIds =
+            Commands.linkToStream streamName version eventIds writer
+        let readLimit = 1000UL //TODO: Configuration?
+        let readStreamFoward name startingPosition =
+            Repository.readEventsForward cts.Token connString name startingPosition readLimit
+
+
+        let mutable diposeLock = obj()
+        member __.Dispose () =
+            let disposer = Interlocked.Exchange<obj>(&diposeLock, null)
+            if disposer |> isNull |> not then cts.Cancel()
+
+        member __.IsDisposed = diposeLock |> isNull
+
+        member __.AppendToStream =
+            appendToStream
+
+        member __.LinkToStream =
+            linkToStream
+
+        member __.GetStreamInfo steamName = job {
+            use conn =  connString |> DbHelpers.builderToConnection
+            do! conn |> DbHelpers.ensureOpen
+            let! result = Repository.getStreamByName conn steamName
+            return result
+        }
+
+        member __.ReadFowardFromStream =
+            readStreamFoward
+
+        member __.SubscribeToStream streamName subscriptionName (subscriptionPosition : SubscriptionPosition)= job {
+            let src = Stream.Src.create<Ack*DbTypes.RecordedEvent>()
+            return Stream.Src.tap src
+        }
+        member __.UnsubscribeToStream streamName subscriptionName (subscriptionPosition : SubscriptionPosition)= job {
+            ()
+        }
+
+        static member Create (connString : NpgsqlConnectionStringBuilder) = job {
+            let! writer = Commands.create connString
+            return new Eventstore(connString,writer)
+        }
+
+        interface IDisposable with
+            member __.Dispose() = __.Dispose()

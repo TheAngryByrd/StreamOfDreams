@@ -65,12 +65,13 @@ module Hopac =
         }
 
     module Alt =
-        let ctToAlt pollInterval (ct : CancellationToken) =
-            Alt.prepare <| job {
-                while ct.IsCancellationRequested |> not do
-                    do! timeOut pollInterval
-                return Alt.unit()
-            }
+        let fromCT (ct : CancellationToken) =
+            let cancelled = IVar()
+            let sub = ct.Register(fun () ->
+                cancelled *<=  () |> start)
+            (cancelled)
+            ^-> sub.Dispose
+
 
     type BoundedAckingMb<'x> = {putCh: Ch<'x>; takeCh: Ch<'x>; ackCh : Ch<unit>}
 
@@ -197,6 +198,7 @@ module Disposable =
         new () = new CTSCancelOnDispose(new CancellationTokenSource())
 
         member __.CancellationTokenSource = cts
+        member __.Token = __.CancellationTokenSource.Token
 
         member __.Dispose () =
             let disposer = Interlocked.Exchange<string>(&dipose, null)

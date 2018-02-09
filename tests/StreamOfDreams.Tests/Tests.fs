@@ -576,6 +576,17 @@ module All =
                     do! Expect.throwsTJ<Commands.ConcurrencyException> (fun () ->Commands.appendToStream streamName (DomainTypes.Version.Value 1UL) events writer |> Job.Ignore ) "Should throw concurreny exception"
                     ()
                 }
+                testCaseJob' "Stream doesnt exist, should succeed with Version value set to 0" <| fun db -> job {
+                    let connStr = helpfulConnStrAddtions db.Conn
+                    let! writer = Commands.create connStr
+                    use connection = new NpgsqlConnection(connStr |> string)
+                    do! connection |> ensureOpen
+                    let streamName = "Bank-124562"
+
+                    let events = generatePeopleEvents 1 |> Seq.toArray
+                    do! Commands.appendToStream streamName (DomainTypes.Version.Value 0UL) events writer |> Job.Ignore
+
+                }
                 testCaseJob' "Stream doesnt exist, should fail with Version value set to number" <| fun db -> job {
                     let connStr = helpfulConnStrAddtions db.Conn
                     let! writer = Commands.create connStr
@@ -591,12 +602,13 @@ module All =
         ]
 
     let createByEventType eventType = String.format "$et-{0}" eventType
-    let eventTypeProjection ct connStr = job {
+    let eventTypeProjection (eventstore : Eventstore.Eventstore) ct  (connStr) = job {
 
         let! notifications = StreamOfDreams.Subscriptions.startNotify ct connStr
+
         notifications
         |> Stream.filterFun(fun n -> n.StreamName = "$all")
-        |> Stream.takeUntil (Alt.ctToAlt (TimeSpan.FromMilliseconds(100.)) ct)
+        |> Stream.takeUntil (Alt.fromCT ct)
         |> Stream.iterJob (fun notification -> job {
             let diff  = (notification.LastWriteVersion - notification.FirstWriteVersion)
             let! events =
@@ -606,23 +618,26 @@ module All =
                 |> Job.bind(Stream.toSeq)
             // printfn "%A" notification
             // printfn "%A" events
-            use conn = builderToConnection connStr
-            do! ensureOpen conn
+            // use conn = builderToConnection connStr
+            // do! ensureOpen conn
             do!
                     events
                     |> Seq.groupBy(fun e -> e.EventType)
                     |> Seq.map(fun (e, xs) -> job {
-
                         let streamName = createByEventType e
-                        use createStream = Repository.prepareCreateStream conn streamName
-                        let! streamId = createStream |> executeScalar<int64>
 
-
-                        use linkEt =
+                        //TODO: keep track of version
+                        let! streamInfo = eventstore.GetStreamInfo streamName
+                        let version =
+                            match streamInfo with
+                            | Some s -> s.Version
+                            | None -> 0UL
+                        let! result =
                             xs
                             |> Seq.map(fun e -> e.Id)
-                            |> Repository.prepareLinkEvents conn streamId
-                        do! linkEt |> executeNonQueryIgnore
+                            |> eventstore.LinkToStream streamName (DomainTypes.Version.Value version)
+                        ()
+
 
                     })
                     |> Job.seqIgnore
@@ -690,33 +705,30 @@ module All =
                     Expect.sequenceEqual result expected "Did not receive notification events in order"
                 }
                 testCaseJob' "foo2" <| fun db -> job {
-                    use cts = new CancellationTokenSource()
+                    use! eventstore = Eventstore.Eventstore.Create(db.Conn)
+                    use cts = new Disposable.CTSCancelOnDispose()
                     use conn = db.Conn |> builderToConnection
                     do! ensureOpen conn
-                    do! eventTypeProjection cts.Token db.Conn
+                    do! eventTypeProjection eventstore cts.Token  db.Conn
                     let streamName = "Bank-124562"
-                    let eventCount = 1000
+                    let eventCount = 100
                     let! writer = Commands.create db.Conn
                     let events = generatePeopleEvents eventCount |> Seq.toArray
 
-                    let upTo = 200
+                    let upTo = 20
                     do! [1..upTo]
                         |> Seq.map (fun _ ->
-                            Commands.appendToStream streamName DomainTypes.Version.Any events writer |> Job.Ignore)
+                            eventstore.AppendToStream streamName DomainTypes.Version.Any events |> Job.Ignore)
                         |> Job.seqIgnore
-                    // printfn "%A" events
-                    // do!
-                    // do! Commands.appendToStream streamName DomainTypes.Version.Any events writer
-                    //     |> Job.Ignore
 
                     do! timeOutMillis 1000
 
                     let! stream =
-                        Repository.getStreamByName conn streamName
+                        Repository.getStreamByName conn "$et-person"
                         |> Job.map Option.get
                     printfn "%A" stream
                     Expect.equal stream.Version (uint64 eventCount * uint64 upTo) "Not same"
-                    cts.Cancel()
+
                 }
             ]
         ]
