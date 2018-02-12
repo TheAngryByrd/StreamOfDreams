@@ -335,23 +335,23 @@ module All =
         testList "Stream Table Tests" [
             yield! testFixtureAsync withMigratedDatabase [
                 testCaseJob' "No Streams inserted yet" <| fun db -> job {
-                    use connection = new NpgsqlConnection(db.Conn |> string)
-                    do! connection |> ensureOpen
-                    let! result = Repository.getStreamByName connection "DoesntExist"
+                    use cts = new Disposable.CTSCancelOnDispose()
+                    use! connection = createOpenConnectionCt cts.Token db.Conn
+                    let! result = Repository.getStreamByName cts.Token connection "DoesntExist"
                     Expect.isNone result "Should find none"
                     return ()
                 }
                 testCaseJob' "Create Stream, find one" <| fun db -> job {
                     let streamName = "Bank-12345"
-                    use connection = new NpgsqlConnection(db.Conn |> string)
-                    do! connection |> ensureOpen
+                    use cts = new Disposable.CTSCancelOnDispose()
+                    use! connection = createOpenConnectionCt cts.Token db.Conn
 
                     do! Repository.prepareCreateStream connection streamName
                         |> executeReader
                         |> Job.usingJob' ^ fun reader ->
                              Job.result ()
 
-                    let! result = Repository.getStreamByName connection streamName
+                    let! result = Repository.getStreamByName cts.Token connection streamName
                     Expect.isSome result "Should find Some"
                     // printfn "%A" result
                     return ()
@@ -432,8 +432,12 @@ module All =
         testList "Command tests" [
             yield! testFixtureAsync withMigratedDatabase [
                 testCaseJob' "Append many to single stream" <| fun db -> job {
+                    use cts = new Disposable.CTSCancelOnDispose()
+
                     let connStr = helpfulConnStrAddtions db.Conn
-                    let! writer = Commands.create connStr
+                    use! connection = createOpenConnectionCt cts.Token connStr
+
+                    let! writer = Commands.create cts.Token connStr
                     use connection = new NpgsqlConnection(connStr |> string)
                     do! connection |> ensureOpen
                     let streamName = "Bank-12456"
@@ -444,12 +448,12 @@ module All =
 
                     Expect.equal writeResult.NextExpectedVersion (uint64 eventsToGenerate) "Not expected Version"
 
-                    let! allStream = Repository.getStreamByName connection "$all" |> Job.map Option.get
+                    let! allStream = Repository.getStreamByName cts.Token  connection "$all" |> Job.map Option.get
                     Expect.equal allStream.Version (uint64 eventsToGenerate) "Not expected Version"
 
-                    let! stream = Repository.getStreamByName connection (streamName) |> Job.map Option.get
+                    let! stream = Repository.getStreamByName cts.Token  connection (streamName) |> Job.map Option.get
                     Expect.equal stream.Version (uint64 eventsToGenerate) "Not expected Version"
-                    use cts = new Threading.CancellationTokenSource()
+
                     let! events =
                          Repository.readEventsForward cts.Token connStr streamName 0UL 10000UL
                          |> Job.map Option.get
@@ -458,11 +462,14 @@ module All =
                             events
                             |> Stream.foldFun (fun x s -> x + 1) 0
                     Expect.equal length (eventsToGenerate) "Events not written to stream"
-                    cts.Cancel()
+                    ()
                 }
                 testCaseJob' "Read forever" <| fun db -> job {
+                    use cts = new Disposable.CTSCancelOnDispose()
+
                     let connStr = helpfulConnStrAddtions db.Conn
-                    let! writer = Commands.create connStr
+                    use! connection = createOpenConnectionCt cts.Token connStr
+                    let! writer = Commands.create cts.Token connStr
                     use connection = new NpgsqlConnection(connStr |> string)
                     do! connection |> ensureOpen
                     let streamName = "Bank-12456"
@@ -473,14 +480,11 @@ module All =
 
                     Expect.equal writeResult.NextExpectedVersion (uint64 eventsToGenerate) "Not expected Version"
 
-                    let! allStream = Repository.getStreamByName connection "$all" |> Job.map Option.get
+                    let! allStream = Repository.getStreamByName cts.Token connection "$all" |> Job.map Option.get
                     Expect.equal allStream.Version (uint64 eventsToGenerate) "Not expected Version"
 
-                    let! stream = Repository.getStreamByName connection (streamName) |> Job.map Option.get
+                    let! stream = Repository.getStreamByName cts.Token connection (streamName) |> Job.map Option.get
                     Expect.equal stream.Version (uint64 eventsToGenerate) "Not expected Version"
-
-
-                    use cts = new Threading.CancellationTokenSource()
 
                     let! events =
                          Repository.readEventsForwardForever cts.Token connStr streamName 0UL 10000UL
@@ -511,14 +515,15 @@ module All =
                     |> start
                     do! sema.WaitAsync() |> Job.awaitUnitTask
                     Expect.equal (length) (writeResult.NextExpectedVersion) "Events not written to stream"
-                    cts.Cancel()
                 }
 
                 testCaseJob' "Stream exists, should fail with NoStream set" <| fun db -> job {
+                    use cts = new Disposable.CTSCancelOnDispose()
+
                     let connStr = helpfulConnStrAddtions db.Conn
-                    let! writer = Commands.create connStr
-                    use connection = new NpgsqlConnection(connStr |> string)
-                    do! connection |> ensureOpen
+                    use! connection = createOpenConnectionCt cts.Token connStr
+
+                    let! writer = Commands.create cts.Token connStr
                     let streamName = "Bank-124562"
 
                     let! _ = Repository.prepareCreateStream  connection streamName |> executeNonQuery
@@ -527,10 +532,12 @@ module All =
                     ()
                 }
                 testCaseJob' "Stream doesnt exist, should fail with StreamExists set" <| fun db -> job {
+                    use cts = new Disposable.CTSCancelOnDispose()
+
                     let connStr = helpfulConnStrAddtions db.Conn
-                    let! writer = Commands.create connStr
-                    use connection = new NpgsqlConnection(connStr |> string)
-                    do! connection |> ensureOpen
+
+                    let! writer = Commands.create cts.Token connStr
+
                     let streamName = "Bank-124562"
 
                     let events = generatePeopleEvents 1 |> Seq.toArray
@@ -538,10 +545,12 @@ module All =
                     ()
                 }
                 testCaseJob' "Stream exist with items already, should fail with EmptyStream set" <| fun db -> job {
+                    use cts = new Disposable.CTSCancelOnDispose()
+
                     let connStr = helpfulConnStrAddtions db.Conn
-                    let! writer = Commands.create connStr
-                    use connection = new NpgsqlConnection(connStr |> string)
-                    do! connection |> ensureOpen
+
+                    let! writer = Commands.create cts.Token connStr
+
                     let streamName = "Bank-124562"
 
                     let events = generatePeopleEvents 1 |> Seq.toArray
@@ -552,10 +561,12 @@ module All =
                     ()
                 }
                 testCaseJob' "Stream doesn't exist, should fail with EmptyStream set" <| fun db -> job {
+                    use cts = new Disposable.CTSCancelOnDispose()
+
                     let connStr = helpfulConnStrAddtions db.Conn
-                    let! writer = Commands.create connStr
-                    use connection = new NpgsqlConnection(connStr |> string)
-                    do! connection |> ensureOpen
+
+                    let! writer = Commands.create cts.Token connStr
+
                     let streamName = "Bank-124562"
 
                     let events = generatePeopleEvents 1 |> Seq.toArray
@@ -563,10 +574,11 @@ module All =
                     ()
                 }
                 testCaseJob' "Stream exists with another version, should fail with Version value set to another number" <| fun db -> job {
+                    use cts = new Disposable.CTSCancelOnDispose()
+
                     let connStr = helpfulConnStrAddtions db.Conn
-                    let! writer = Commands.create connStr
-                    use connection = new NpgsqlConnection(connStr |> string)
-                    do! connection |> ensureOpen
+
+                    let! writer = Commands.create cts.Token connStr
                     let streamName = "Bank-124562"
 
                     let events = generatePeopleEvents 3 |> Seq.toArray
@@ -577,10 +589,11 @@ module All =
                     ()
                 }
                 testCaseJob' "Stream doesnt exist, should succeed with Version value set to 0" <| fun db -> job {
+                    use cts = new Disposable.CTSCancelOnDispose()
+
                     let connStr = helpfulConnStrAddtions db.Conn
-                    let! writer = Commands.create connStr
-                    use connection = new NpgsqlConnection(connStr |> string)
-                    do! connection |> ensureOpen
+                    let! writer = Commands.create cts.Token connStr
+
                     let streamName = "Bank-124562"
 
                     let events = generatePeopleEvents 1 |> Seq.toArray
@@ -588,10 +601,12 @@ module All =
 
                 }
                 testCaseJob' "Stream doesnt exist, should fail with Version value set to number" <| fun db -> job {
+                    use cts = new Disposable.CTSCancelOnDispose()
+
                     let connStr = helpfulConnStrAddtions db.Conn
-                    let! writer = Commands.create connStr
-                    use connection = new NpgsqlConnection(connStr |> string)
-                    do! connection |> ensureOpen
+
+                    let! writer = Commands.create cts.Token connStr
+
                     let streamName = "Bank-124562"
 
                     let events = generatePeopleEvents 1 |> Seq.toArray
@@ -608,7 +623,7 @@ module All =
 
         notifications
         |> Stream.filterFun(fun n -> n.StreamName = "$all")
-        |> Stream.takeUntil (Alt.fromCT ct)
+        // |> Stream.takeUntil (Alt.fromCT ct)
         |> Stream.iterJob (fun notification -> job {
             let diff  = (notification.LastWriteVersion - notification.FirstWriteVersion)
             let! events =
@@ -654,7 +669,7 @@ module All =
                 let (expected : Subscriptions.Notification) = {
                     StreamName = "Bank-124562"
                     StreamId   = 1UL
-                    FirstWriteVersion = 1UL
+                    LastVersion = 1UL
                     LastWriteVersion = 3UL
                 }
                 let actual =  Subscriptions.Notification.parse notificationStr
@@ -664,72 +679,123 @@ module All =
                 let (expected : Subscriptions.Notification) = {
                     StreamName = "Bank,124562"
                     StreamId   = 1UL
-                    FirstWriteVersion = 1UL
+                    LastVersion = 1UL
                     LastWriteVersion = 3UL
                 }
+
                 let actual =  Subscriptions.Notification.parse notificationStr
                 Expect.equal actual expected "Didn't parse notification event correctly"
 
             yield! testFixtureAsync withMigratedDatabase [
-                testCaseJob' "Foo" <| fun db -> job {
-                    use cts = new CancellationTokenSource()
-                    // let foo = db.Conn
-                    let! notificationChannel = StreamOfDreams.Subscriptions.startNotify cts.Token db.Conn
-                    let! writer = Commands.create db.Conn
-                    use connection = builderToConnection db.Conn
-                    do! connection |> ensureOpen
-                    let streamName = "Bank-124562"
-                    let eventCount = 3
-                    let events = generatePeopleEvents eventCount |> Seq.toArray
-                    do! Commands.appendToStream streamName DomainTypes.Version.Any events writer
-                        |> Job.Ignore
-
-                    let! promise =
-                        notificationChannel
-                        |> Stream.toSeq
-                        |> Promise.start
-
-                    do! Commands.appendToStream streamName DomainTypes.Version.Any events writer
-                        |> Job.Ignore
-                    let expected =
-                        [
-                            "Bank-124562,1,0,3"
-                            "$all,0,0,3"
-                            "Bank-124562,1,3,6"
-                            "$all,0,3,6"
-                        ]
-                        |> Seq.map Subscriptions.Notification.parse
-
-                    cts.Cancel()
-                    let! result = promise
-                    Expect.sequenceEqual result expected "Did not receive notification events in order"
-                }
-                testCaseJob' "foo2" <| fun db -> job {
-                    use! eventstore = Eventstore.Eventstore.Create(db.Conn)
+                testCaseJob' "Subscriber no events yet" <| fun db -> job {
                     use cts = new Disposable.CTSCancelOnDispose()
-                    use conn = db.Conn |> builderToConnection
-                    do! ensureOpen conn
-                    do! eventTypeProjection eventstore cts.Token  db.Conn
+                    let ct = cts.Token
+                    let connStr = db.Conn
+                    let! notifier =
+                        StreamOfDreams.Subscriptions.startNotify ct connStr
+
+                    let src = Stream.Src.create()
+
+                    let! subscriber =
+                        Subscriptions.Subsciption.create
+                            ct
+                            connStr
+                            "$all"
+                            "GET ALL"
+                            DomainTypes.SubscriptionPosition.Continue
+                            src
+
+                    let! writer = Commands.create cts.Token db.Conn
                     let streamName = "Bank-124562"
-                    let eventCount = 100
-                    let! writer = Commands.create db.Conn
+                    let eventCount = 1
+                    do! timeOutMillis 100
+
                     let events = generatePeopleEvents eventCount |> Seq.toArray
+                    do! Commands.appendToStream streamName DomainTypes.Version.Any events writer
+                        |> Job.Ignore
+                    let outputStream = Stream.Src.tap src
+                    // do! timeOutMillis 100
+                    let! notifyingDone =
+                        notifier
+                        |> Stream.mapFun(fun x -> printfn "NOTIFICATION %A" x; x)
+                        |> Stream.iterJob(Subscriptions.Subsciption.notify subscriber)
+                        |> Promise.start
+                    let! outputDone =
+                         outputStream
+                         |> Stream.iterJob ^ fun (conn, ack, event) -> job {
+                            //  printfn "%A" event
+                             do! ack
+                             return ()
+                         }
+                         |> Promise.start
 
-                    let upTo = 20
-                    do! [1..upTo]
-                        |> Seq.map (fun _ ->
-                            eventstore.AppendToStream streamName DomainTypes.Version.Any events |> Job.Ignore)
-                        |> Job.seqIgnore
 
-                    do! timeOutMillis 1000
-
-                    let! stream =
-                        Repository.getStreamByName conn "$et-person"
-                        |> Job.map Option.get
-                    printfn "%A" stream
-                    Expect.equal stream.Version (uint64 eventCount * uint64 upTo) "Not same"
-
+                    do! timeOutMillis 100
+                    do! Commands.appendToStream streamName DomainTypes.Version.Any events writer
+                        |> Job.Ignore
+                    do! timeOutMillis 100
+                    return ()
                 }
+                // testCaseJob' "Foo" <| fun db -> job {
+                //     use cts = new CancellationTokenSource()
+                //     // let foo = db.Conn
+                //     let! notificationChannel = StreamOfDreams.Subscriptions.startNotify cts.Token db.Conn
+                //     let! writer = Commands.create db.Conn
+                //     use connection = builderToConnection db.Conn
+                //     do! connection |> ensureOpen
+                //     let streamName = "Bank-124562"
+                //     let eventCount = 3
+                //     let events = generatePeopleEvents eventCount |> Seq.toArray
+                //     do! Commands.appendToStream streamName DomainTypes.Version.Any events writer
+                //         |> Job.Ignore
+
+                //     let! promise =
+                //         notificationChannel
+                //         |> Stream.toSeq
+                //         |> Promise.start
+
+                //     do! Commands.appendToStream streamName DomainTypes.Version.Any events writer
+                //         |> Job.Ignore
+                //     let expected =
+                //         [
+                //             "Bank-124562,1,0,3"
+                //             "$all,0,0,3"
+                //             "Bank-124562,1,3,6"
+                //             "$all,0,3,6"
+                //         ]
+                //         |> Seq.map Subscriptions.Notification.parse
+
+                //     cts.Cancel()
+                //     let! result = promise
+                //     Expect.sequenceEqual result expected "Did not receive notification events in order"
+                // }
+                // testCaseJob' "foo2" <| fun db -> job {
+                //     use! eventstore = Eventstore.Eventstore.Create(db.Conn)
+                //     use cts = new Disposable.CTSCancelOnDispose()
+                //     use conn = db.Conn |> builderToConnection
+                //     do! ensureOpen conn
+                //     do! eventTypeProjection eventstore cts.Token  db.Conn
+                //     let streamName = "Bank-124562"
+                //     let eventCount = 100
+                //     let! writer = Commands.create db.Conn
+                //     let events = generatePeopleEvents eventCount |> Seq.toArray
+
+                //     let upTo = 20
+                //     do! [1..upTo]
+                //         |> Seq.map (fun _ ->
+                //             eventstore.AppendToStream streamName DomainTypes.Version.Any events |> Job.Ignore)
+                //         |> Job.seqIgnore
+
+                //     //TODO: Waits are bad.  You should feel bad.
+                //     do! timeOutMillis 1000
+
+                //     let! stream =
+                //         Repository.getStreamByName conn "$et-person"
+                //         |> Job.map Option.get
+                //     // printfn "%A" stream
+                //     Expect.equal stream.Version (uint64 eventCount * uint64 upTo) "Not same"
+
+                // }
             ]
         ]
 

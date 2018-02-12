@@ -35,6 +35,7 @@ module DbHelpers =
     open Hopac
     open System.Threading
 
+
     let inline builderToConnection (connStr : NpgsqlConnectionStringBuilder) =
         new NpgsqlConnection (connStr |> string)
 
@@ -44,25 +45,36 @@ module DbHelpers =
         else
             Alt.unit()
 
+    let inline ensureOpenCt ct (connection : NpgsqlConnection) = job {
+        if not <| connection.FullState.HasFlag System.Data.ConnectionState.Open then
+            do!  (connection.OpenAsync ct) |> Job.awaitUnitTask
 
-    // let inline createAndOpenConnection (connStr : NpgsqlConnectionStringBuilder) =
-    //     let conn =
-    //         connStr
-    //         |> builderToConnection
-    //     conn
-    //     |> Alt.always
-    //     |> Alt.afterJob ensureOpen
-    //     |> Alt.afterFun(fun _ -> conn)
+    }
+
+    let inline createOpenConnection (connStr : NpgsqlConnectionStringBuilder) = job {
+        let conn =
+            connStr
+            |> builderToConnection
+        do! ensureOpen conn
+        return conn
+    }
+    let inline createOpenConnectionCt ct (connStr : NpgsqlConnectionStringBuilder) = job {
+        let conn =
+            connStr
+            |> builderToConnection
+        do! ensureOpenCt ct conn
+        return conn
+    }
 
     let inline executeReader (cmd : NpgsqlCommand) =
         Alt.fromTask cmd.ExecuteReaderAsync
-        |> Job.map (unbox<NpgsqlDataReader>)
+        |> Alt.afterFun (unbox<NpgsqlDataReader>)
 
-    let inline executeReaderCt (external: CancellationToken) (cmd : NpgsqlCommand) =
-        Alt.fromTask (fun ct ->
-            use cts = CancellationTokenSource.CreateLinkedTokenSource(ct,external)
-            cmd.ExecuteReaderAsync cts.Token)
-        |> Job.map (unbox<NpgsqlDataReader>)
+    let inline executeReaderCt (ct: CancellationToken) (cmd : NpgsqlCommand) = job {
+        let! reader = cmd.ExecuteReaderAsync ct
+
+        return reader |> unbox<NpgsqlDataReader>
+    }
 
     let inline executeScalar<'a> (cmd : NpgsqlCommand) =
         Alt.fromTask cmd.ExecuteScalarAsync
@@ -102,15 +114,15 @@ module DbHelpers =
     let inline bigintParam param value =
         explicitParam NpgsqlDbType.Bigint param value
 
-    let inline readRow (reader: NpgsqlDataReader) =
+    let inline readRow ct (reader: NpgsqlDataReader) =
         let readValueAsync fieldIndex =
           job {
               let fieldName = reader.GetName fieldIndex
-              let! isNull = reader.IsDBNullAsync fieldIndex
+              let! isNull = reader.IsDBNullAsync(fieldIndex,ct)
               if isNull then
                 return fieldName, None
               else
-                let! value = reader.GetFieldValueAsync fieldIndex
+                let! value = reader.GetFieldValueAsync(fieldIndex,ct)
                 return fieldName, Some value
           }
 
@@ -119,24 +131,24 @@ module DbHelpers =
         |> Job.seqCollect
         |> Job.map List.ofSeq
 
-    let inline readTable (reader: NpgsqlDataReader) =
+    let inline readTable ct (reader: NpgsqlDataReader) =
         let rec readRows rows = job {
-            let! canRead = reader.ReadAsync()
+            let! canRead = reader.ReadAsync(ct)
             if canRead then
-              let! row = readRow reader
+              let! row = readRow ct reader
               return! readRows (row :: rows)
             else
               return rows
         }
         readRows []
 
-    let inline readFirstRow  (reader: NpgsqlDataReader) =
+    let inline readFirstRow ct  (reader: NpgsqlDataReader) =
         reader
-        |> readTable
+        |> readTable ct
         |> Job.map Seq.tryHead
 
-    let inline mapRow f =
-        readTable
+    let inline mapRow ct f =
+        readTable ct
         >> Job.map (List.choose f)
 
 module DbTypes =
@@ -211,6 +223,10 @@ module DbTypes =
                     Metadata  = None
                     CreatedAt =  DateTime.MinValue
                 }
+open DbTypes
+open Hopac.Stream
+open System.Threading
+open Hopac
 
 module Repository =
     open System
@@ -374,11 +390,11 @@ module Repository =
         cmd
 
 
-    let getStreamByName conn (streamName : StreamName) = job {
+    let getStreamByName ct conn (streamName : StreamName) = job {
         use cmd = preparestreamIdAndVersion conn streamName
-        use! reader = cmd |> executeReader
+        use! reader = cmd |> executeReaderCt ct
 
-        let! rowOpt = readFirstRow (reader)
+        let! rowOpt = readFirstRow ct (reader)
 
         let retVal =
             match rowOpt with
@@ -421,7 +437,7 @@ module Repository =
             INNER JOIN streams s ON s.stream_id = se.original_stream_id
             INNER JOIN events e ON se.event_id = e.event_id
             WHERE se.stream_id = @streamId and se.stream_version >= @version
-            ORDER BY se.stream_version
+            ORDER BY se.stream_version DESC
             LIMIT @limit
             """
 
@@ -434,13 +450,12 @@ module Repository =
         // let limit = 3000
 
         let getBatch streamId version = job {
-            use conn = connStr |> builderToConnection
-            do! conn |> ensureOpen
+            use! conn = connStr |> createOpenConnection
             use cmd = prepareReadFoward conn streamId version limit
             use! reader = cmd |> executeReaderCt token
             let! results =
                 reader
-                |> mapRow ^ function
+                |> mapRow token ^ function
                     | [ "stream_version", Some streamVersion
                         "event_id", Some eventId
                         "stream_name", Some streamName
@@ -453,8 +468,8 @@ module Repository =
                         "created_at", Some createdAt ]
                             -> Some <|
                                 {
-                                    Id =  eventId |> unbox<Guid>
                                     Number = originalVersion |> unbox<int64> |> uint64
+                                    Id =  eventId |> unbox<Guid>
                                     StreamName =  streamName |> unbox<string>
                                     StreamVersion = streamVersion |> unbox<int64> |> uint64
                                     CorrelationId= correlation |> unbox<Guid option>
@@ -467,12 +482,14 @@ module Repository =
                                 }
                     | _ ->
                         None
+            // printfn "readEventsForwardInner: %A" results
             return results
         }
-        use conn = connStr |> builderToConnection
-        do! conn |> ensureOpen
 
-        let! streamOpt = getStreamByName conn streamName
+        let! streamOpt = job {
+            use! conn = connStr |> createOpenConnectionCt token
+            return! getStreamByName token conn streamName
+        }
 
         match streamOpt with
         | Some s ->
@@ -495,14 +512,18 @@ module Repository =
                     }
 
                 // >> Stream.doFinalizeFun (fun _ -> token.)
-            return Some (xs startVersion |> Stream.appendMap (Stream.ofSeq))
+            return Some (xs startVersion)
         | None ->
             return None
     }
 
-    let readEventsForwardForever = readEventsForwardInner true
+    let readEventsForwardForever token (connStr : NpgsqlConnectionStringBuilder) (streamName : StreamName) (startVersion : uint64) (limit : uint64) =
+        readEventsForwardInner true token connStr streamName startVersion limit
+        |> Job.map (Option.map(Stream.appendMap (Stream.ofSeq)))
 
-    let readEventsForward = readEventsForwardInner false
+    let readEventsForward token (connStr : NpgsqlConnectionStringBuilder) (streamName : StreamName) (startVersion : uint64) (limit : uint64) =
+       readEventsForwardInner false token connStr streamName startVersion limit
+       |>Job.map (Option.map(Stream.appendMap (Stream.ofSeq)))
 
 
 
@@ -555,12 +576,12 @@ module Repository =
         // printfn "%A" cmd.CommandText
         cmd
 
-    let insertEvents conn (events : DbTypes.RecordedEvent seq) = job {
+    let insertEvents ct conn (events : DbTypes.RecordedEvent seq) = job {
          use cmd = prepareInsertEvents conn events
          use! reader = cmd |> executeReader
          return!
              reader
-             |> mapRow ^ fun row ->
+             |> mapRow ct ^ fun row ->
                 match row with
                 | ["event_id", Some id] ->
                     id |> unbox<Guid> |> Some
@@ -583,14 +604,14 @@ module Commands =
     }
     exception ConcurrencyException of string
 
-    let internal concurrencyCheck conn streamName version = job {
+    let internal concurrencyCheck ct conn streamName version = job {
         let! streamOpt = //Job.benchmark "getStreamByName" ^ fun () ->
-                    Repository.getStreamByName conn streamName
+                    Repository.getStreamByName ct conn streamName
         let createStream () =
             Repository.prepareCreateStream conn streamName
             |> DbHelpers.executeNonQuery
             |> Job.bind ^ fun _ ->
-                Repository.getStreamByName conn streamName
+                Repository.getStreamByName ct conn streamName
             |> Job.map Option.get
         return!
             // https://eventstore.org/docs/dotnet-api/4.0.2/optimistic-concurrency-and-idempotence/
@@ -626,22 +647,21 @@ module Commands =
     }
 
 
-    let appendToStream' (connStr : NpgsqlConnectionStringBuilder) streamName (version : Version) events = job {
-        use conn = builderToConnection connStr
-        do! conn |> ensureOpen
+    let appendToStream' ct (connStr : NpgsqlConnectionStringBuilder) streamName (version : Version) events = job {
+        use! conn = createOpenConnectionCt ct connStr
         use transaction = conn.BeginTransaction()
 
-        let! stream = concurrencyCheck conn streamName version
+        let! stream = concurrencyCheck ct conn streamName version
 
 
-        let! savedEvents = Repository.insertEvents conn events
+        let! savedEvents = Repository.insertEvents ct conn events
         use cmd = Repository.prepareCreateStreamEvents conn stream.Id (savedEvents)
         let! nextExpectedVersion = cmd |> executeScalar<int64>
 
         use cmd = Repository.prepareLinkEvents conn AllStreamId (savedEvents)
         do! cmd |> executeNonQueryIgnore
 
-        do! transaction.CommitAsync()
+        do! transaction.CommitAsync(ct)
             |> Job.awaitUnitTask
 
         return {
@@ -649,17 +669,16 @@ module Commands =
             EventIds = savedEvents
         }
     }
-    let linkToStream' (connStr : NpgsqlConnectionStringBuilder) streamName (version : Version) eventIds = job {
-        use conn = builderToConnection connStr
-        do! conn |> ensureOpen
+    let linkToStream' ct (connStr : NpgsqlConnectionStringBuilder) streamName (version : Version) eventIds = job {
+        use! conn = createOpenConnectionCt ct connStr
         use transaction = conn.BeginTransaction()
 
-        let! stream = concurrencyCheck conn streamName version
+        let! stream = concurrencyCheck ct conn streamName version
 
         use cmd = Repository.prepareLinkEvents conn stream.Id (eventIds)
         let! nextExpectedVersion = cmd |> executeScalar<int64>
 
-        do! transaction.CommitAsync()
+        do! transaction.CommitAsync(ct)
             |> Job.awaitUnitTask
 
         return {
@@ -674,17 +693,17 @@ module Commands =
     | LinkToStream of StreamName*Version*seq<EventId>*Actors.ReplyChannel<Choice<AppendResult,exn>>
 
     //TODO make singleton
-    let create connectionString =
+    let create ct connectionString =
         Actors.actor <|
             fun mb -> Job.foreverServer (Mailbox.take mb >>= function
                 | AppendToStream(name,version,events, reply) ->
                     job {
-                        let! result = appendToStream' connectionString name version events |> Job.catch
+                        let! result = appendToStream' ct connectionString name version events |> Job.catch
                         do! Actors.reply reply result
                     }
                 | LinkToStream(name,version,eventIds, reply) ->
                     job {
-                        let! result = linkToStream' connectionString name version eventIds |> Job.catch
+                        let! result = linkToStream' ct connectionString name version eventIds |> Job.catch
                         do! Actors.reply reply result
                     }
             )
@@ -706,28 +725,39 @@ module Commands =
 
 
 module Subscriptions =
+
     open DbHelpers
     open System
     open System.Linq
     open Hopac
+    open Hopac.Infixes
     open Npgsql
     open System.Threading
-    // initial -> subscribe_to_events -> request_catch_up -> catching_up -> subscribed
+    open DomainTypes
 
-    type SubscriptionState =
-    | Initial
-    | SubscribeToEvents
-    | RequestCatchUp
-    | Catchup
-    | Subscribed
+    /// https://i.imgur.com/xw9yypr.jpg
+    /// Alias for `Job<unit>` that a subscriber recieved an handled an event.
+    type Ack = Promise<unit>
 
+    /// A notfication event.  This gets fired after each update to the `streams` table.
     type Notification = {
+        /// Name of the stream with new events either added or linked
         StreamName : string
+        /// Id of the stream with new events either added or linked
         StreamId : uint64
-        FirstWriteVersion: uint64
+        /// Previous version of the stream
+        LastVersion : uint64
+        /// The position of the last event written in this batch
         LastWriteVersion: uint64
     }
     with
+        /// The position of the first event written in this batch.  Should always be `LastVersion` + 1.
+        member __.FirstWriteVersion =
+            __.LastVersion + 1UL
+        /// The number of events written in this batch
+        member __.EventsWritten =
+            __.LastWriteVersion - __.LastVersion
+        /// Parses notification events from postgres.  Takes the form of `stream-12345,1,1,5`
         static member parse (notification : string) =
 
             let parts =
@@ -738,9 +768,97 @@ module Subscriptions =
             {
                 StreamName = parts.[3]
                 StreamId   = parts.[2] |> uint64
-                FirstWriteVersion = parts.[1] |> uint64
+                LastVersion =  parts.[1] |> uint64
                 LastWriteVersion = parts.[0] |> uint64
             }
+
+    type Subscriber = { notification : Ch<Notification> ; }
+
+    module Subsciption =
+        let create
+            ct
+            (connStr : NpgsqlConnectionStringBuilder)
+            (streamName)
+            (subscriptionName)
+            (subscriptionPosition : SubscriptionPosition)
+            (output : Src<NpgsqlConnection*Ack*RecordedEvent>) = job {
+                printfn "start"
+                let mutable lastSeen = 0UL
+                let mutable init = true
+                let mutable lastReceived = 0UL
+
+                let output event = job {
+
+                    printfn "out start"
+                    use! connection = connStr |> createOpenConnectionCt ct
+                    use transaction = connection.BeginTransaction()
+                    let ack = IVar()
+
+                    do! Src.value output (connection,IVar.fill ack () |> memo,event)
+                    do! ack
+                    lastSeen <- lastSeen + 1UL
+                    printfn "last seen %A" lastSeen
+                    //Save subscription
+                    // do! saveOrUpdateSubscription event.Number
+                    do! transaction.CommitAsync() |> Job.awaitUnitTask
+
+                    printfn "out end"
+                }
+
+
+
+                let catchup () = job {
+                    printfn "catchup start"
+                    let! result = Repository.readEventsForward ct connStr streamName lastSeen 1000UL
+                    printfn "catchup result: %A" result
+                    match result with
+                    | None -> ()
+                    | Some stream ->
+                        do! stream
+                            // |> Stream.takeUntil (Alt.fromCT ct)
+                            |> Stream.iterJob output
+
+                    printfn "catchup end"
+                }
+
+                //get getOrCreateSubscription
+                //get any new events
+                let self = { notification = Ch()}
+                let notification () =
+                    Ch.take self.notification
+                    ^-> fun notification ->
+                        if notification.StreamName = streamName then
+                            //TODO: WHY -1?
+                            lastReceived <- notification.LastWriteVersion
+
+                let proc = Job.delay ^ fun () -> job {
+                    if init then
+                        printfn "INIT CATCHUP"
+                        do! catchup ()
+                        init <- false
+                    else if lastSeen < lastReceived then
+                        printfn "CAN CATCHUP lastSeen: %d / lastReceived %d " lastSeen lastReceived
+                        do! catchup ()
+                    else
+                        printfn "CAN GET NOTFICATIONS"
+                        do! notification ()
+                }
+
+                return! Job.foreverServer proc >>-. self
+            }
+        let notify (subscriber : Subscriber) notification =
+            Ch.give subscriber.notification notification
+
+    // initial -> subscribe_to_events -> request_catch_up -> catching_up -> subscribed
+
+    type SubscriptionState =
+    | Initial
+    | SubscribeToEvents
+    | RequestCatchUp
+    | Catchup
+    | Subscribed
+
+
 
     let startNotify (ct : CancellationToken) connStr = job {
             // -- Payload text contains:
@@ -751,8 +869,7 @@ module Subscriptions =
             //             -- Each separated by a comma (e.g. 'stream-12345,1,1,5')
         let connStr = NpgsqlConnectionStringBuilder(connStr |> string , KeepAlive = 30)
         let output = Stream.Src.create<NpgsqlNotificationEventArgs>()
-        let conn = builderToConnection connStr
-        do! ensureOpen conn
+        let! conn = createOpenConnection connStr
         use cmd = new NpgsqlCommand(sprintf "LISTEN \"%s\"" "events", conn)
         do! cmd |> executeNonQueryIgnore
 
@@ -921,11 +1038,11 @@ module Eventstore =
     // Typically used for side effects for a stream, like linking events to another stream or send emails.  This typically is not something you can easy undo.
     | PartitionTo of (DbTypes.RecordedEvent -> Job<unit>)
 
-    type Ack = IVar<unit>
 
-    type Eventstore(connString : NpgsqlConnectionStringBuilder, writer) =
 
-        let cts = new CancellationTokenSource()
+    type Eventstore(connString : NpgsqlConnectionStringBuilder, cts : CancellationTokenSource, writer) =
+
+
         let appendToStream streamName version events  =
             Commands.appendToStream streamName version events  writer
         let linkToStream streamName version eventIds =
@@ -951,7 +1068,7 @@ module Eventstore =
         member __.GetStreamInfo steamName = job {
             use conn =  connString |> DbHelpers.builderToConnection
             do! conn |> DbHelpers.ensureOpen
-            let! result = Repository.getStreamByName conn steamName
+            let! result = Repository.getStreamByName cts.Token conn steamName
             return result
         }
 
@@ -959,7 +1076,7 @@ module Eventstore =
             readStreamFoward
 
         member __.SubscribeToStream streamName subscriptionName (subscriptionPosition : SubscriptionPosition)= job {
-            let src = Stream.Src.create<Ack*DbTypes.RecordedEvent>()
+            let src = Stream.Src.create<IVar<unit>*DbTypes.RecordedEvent>()
             return Stream.Src.tap src
         }
         member __.UnsubscribeToStream streamName subscriptionName (subscriptionPosition : SubscriptionPosition)= job {
@@ -967,8 +1084,9 @@ module Eventstore =
         }
 
         static member Create (connString : NpgsqlConnectionStringBuilder) = job {
-            let! writer = Commands.create connString
-            return new Eventstore(connString,writer)
+            let cts = new CancellationTokenSource()
+            let! writer = Commands.create cts.Token connString
+            return new Eventstore(connString,cts,writer)
         }
 
         interface IDisposable with
