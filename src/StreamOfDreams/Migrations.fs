@@ -211,7 +211,7 @@ module Migrations =
                     CREATE TABLE subscriptions
                     (
                         subscription_id bigserial PRIMARY KEY NOT NULL,
-                        stream_uuid text NOT NULL,
+                        stream_name text NOT NULL,
                         subscription_name text NOT NULL,
                         last_seen bigint NULL,
                         created_at timestamp without time zone default (now() at time zone 'utc') NOT NULL
@@ -230,12 +230,12 @@ module Migrations =
             override __.Up () =
                 base.Execute
                     """
-                    CREATE UNIQUE INDEX ix_subscriptions_stream_uuid_subscription_name ON subscriptions (stream_uuid, subscription_name);
+                    CREATE UNIQUE INDEX ix_subscriptions_stream_name_subscription_name ON subscriptions (stream_name, subscription_name);
                     """
             override __.Down () =
                 base.Execute
                     """
-                    DROP INDEX ix_subscriptions_stream_uuid_subscription_name;
+                    DROP INDEX ix_subscriptions_stream_name_subscription_name;
                     """
     [<Migration(20180204124013L, "Create Snapshots Table")>]
     type ``Create Snapshots Table`` () =

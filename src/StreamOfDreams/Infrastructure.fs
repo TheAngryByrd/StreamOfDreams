@@ -43,10 +43,10 @@ module Hopac =
     open System.Collections.Generic
 
     module Job =
-        let inline teeJob (xJ : 'a -> Job<unit>) x = job {
-            do! xJ x
-            return x
-        }
+        let inline teeJob (xJ : 'a -> Job<unit>) x =
+            xJ x
+            >>-. x
+
 
         let inline usingJob (xJ : Job<'a>) (xJyJ : 'a -> Job<'b>)=
             xJ
