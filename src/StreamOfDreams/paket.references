@@ -7,3 +7,5 @@ npgsql
 Hopac
 Newtonsoft.Json
 Simple.Migrations
+
+File: Facade.fs Logging

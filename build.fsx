@@ -34,6 +34,11 @@ Target "Clean" (fun _ ->
 
     )
 
+Target "LoggingFile" (fun _ ->
+    ReplaceInFiles [ "namespace Logary.Facade", "namespace StreamOfDreams.Logging" ]
+                   [ "paket-files/logary/logary/src/Logary.Facade/Facade.fs" ]
+)
+
 Target "DotnetRestore" ^ fun _ ->
         DotNetCli.Restore ^ fun c ->
             { c with
@@ -175,15 +180,19 @@ FinalTarget "KillStarted" <| fun _ ->
 
 ActivateFinalTarget "KillStarted"
 
+
+
 // "Clean"
 //   ==> "DotnetRestore"
-"DotnetBuild"
+"LoggingFile"
+  ==> "DotnetBuild"
   ==> "DotnetTest"
   ==> "DotnetPack"
   ==> "Publish"
   ==> "Release"
 
-"DotnetRestore"
+"LoggingFile"
+ ==> "DotnetRestore"
  ==> "WatchTests"
 
 RunTargetOrDefault "DotnetPack"

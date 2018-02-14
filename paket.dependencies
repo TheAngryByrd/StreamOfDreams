@@ -11,6 +11,7 @@ nuget Expecto
 nuget Expecto.BenchmarkDotNet
 nuget Hopac
 
+github logary/logary src/Logary.Facade/Facade.fs
 
 group Build
     framework: net462
