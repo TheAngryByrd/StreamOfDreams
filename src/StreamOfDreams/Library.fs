@@ -768,11 +768,13 @@ module Commands =
         }
     }
 
+    type Batch = seq<StreamName*Version*seq<EventId>>
     open Hopac.Infixes
     type Msg =
     | AppendToStream of DomainTypes.StreamName*Version*DbTypes.RecordedEvent array*Actors.ReplyChannel<Choice<AppendResult,exn>>
     | LinkToStream of StreamName*Version*seq<EventId>*Actors.ReplyChannel<Choice<AppendResult,exn>>
     | LinkToStreamTransaction of NpgsqlConnection*Promise<unit>*StreamName*Version*seq<EventId>*Actors.ReplyChannel<Choice<AppendResult,exn>>
+    | LinkToStreamTransactionBatch of NpgsqlConnection*Promise<unit>*Batch*Actors.ReplyChannel<Choice<ResizeArray<AppendResult>,exn>>
     //TODO make singleton
     let create ct connectionString =
         Actors.actor <|
@@ -801,6 +803,23 @@ module Commands =
                         // do! timeOutMillis 1
                         printfn "LinkToStreamTransaction Finished"
                     }
+                | LinkToStreamTransactionBatch(conn,doneAck, batch, reply) ->
+                    job {
+                        printfn "LinkToStreamTransactionBatch start"
+                        let! results =
+                            batch
+                            |> Seq.map ^ fun (name,version,eventIds) -> job {
+                                return! linkToStream'' ct conn name version eventIds
+                            }
+                            |> Job.seqCollect
+                            |> Job.catch
+                        printfn "batch: %A" batch
+                        do! Actors.reply reply results
+                        printfn "waiting doneAck"
+                        do! doneAck
+                        // do! timeOutMillis 1
+                        printfn "LinkToStreamTransactionBatch Finished"
+                    }
             )
 
     let appendToStream name version events actor=
@@ -824,6 +843,12 @@ module Commands =
             | Choice2Of2 ex ->
                 Ex.throwPreserve ex
 
+    let linkToStreamTransactionBatch conn doneAck batch actor =
+        Actors.postAndReply actor (fun i -> LinkToStreamTransactionBatch(conn, doneAck, batch,i))
+        |> Job.map ^ function
+            | Choice1Of2 r -> r
+            | Choice2Of2 ex ->
+                Ex.throwPreserve ex
 
 module Subscriptions =
 
@@ -882,7 +907,7 @@ module Subscriptions =
             (streamName)
             (subscriptionName)
             (subscriptionPosition : SubscriptionPosition)
-            (output : Src<NpgsqlConnection*Ack*RecordedEvent*Promise<unit>>)
+            (output : Src<NpgsqlConnection*Ack*RecordedEvent seq*Promise<unit>>)
             readLimit = job {
 
                 //TODO load or create subscription data
@@ -909,7 +934,7 @@ module Subscriptions =
 
                 let output event = job {
 
-                    printfn "out start"
+                    // printfn "out start"
                     // use scope = new Transactions.TransactionScope(Transactions.TransactionScopeAsyncFlowOption.Enabled)
 
                     use! connection = connStr |> createOpenConnectionCt ct
@@ -919,21 +944,22 @@ module Subscriptions =
                     let doneAck = IVar()
                     do! Src.value output (connection,IVar.fill ack () |> memo,event, upcast doneAck )
                     do! ack
-                    lastSeen <- lastSeen + 1UL
+                    lastSeen <- lastSeen + (event |> Seq.length |> uint64)
                     printfn "last seen %A" lastSeen
                     //TODO: Save subscription
                     do! updateSubscription connection lastSeen
+                    printfn "commit transaction"
                     do! transaction.CommitAsync(ct) |> Job.awaitUnitTask
                     do! IVar.fill doneAck ()
                     // scope.Complete()
-                    printfn "out end"
+                    // printfn "out end"
                 }
 
 
 
                 let catchup () = job {
                     printfn "catchup start streamName %A lastSeen %A readLimit %A" streamName lastSeen readLimit
-                    let! result = Repository.readEventsForward ct connStr streamName lastSeen readLimit
+                    let! result = Repository.readEventsForwardBatched ct connStr streamName lastSeen readLimit
                     printfn "catchup result: %A" result
                     match result with
                     | None -> ()
@@ -964,7 +990,7 @@ module Subscriptions =
                         printfn "CAN CATCHUP lastSeen: %d / lastReceived %d " lastSeen lastReceived
                         do! catchup ()
                     else
-                        printfn "CAN GET NOTFICATIONS lastSeen: %d / lastReceived %d " lastSeen lastReceived
+                        // printfn "CAN GET NOTFICATIONS lastSeen: %d / lastReceived %d " lastSeen lastReceived
                         do! notification ()
                 }
 
@@ -1171,6 +1197,8 @@ module Eventstore =
             Commands.linkToStream streamName version eventIds writer
         let linkToStreamTransaction conn doneAck streamName version eventIds =
             Commands.linkToStreamTransaction conn doneAck streamName version eventIds writer
+        let linkToStreamTransactionBatch  conn doneAck batch =
+            Commands.linkToStreamTransactionBatch conn doneAck batch writer
         let readLimit = defaultArg readLimit 1000UL
         let readStreamFoward name startingPosition =
             Repository.readEventsForward cts.Token connString name startingPosition readLimit
@@ -1190,6 +1218,9 @@ module Eventstore =
 
         member __.LinkToStreamTransaction =
             linkToStreamTransaction
+
+        member __.LinkToStreamTransactionBatch =
+            linkToStreamTransactionBatch
         member __.GetStreamInfo steamName = job {
             use! conn =  connString |> DbHelpers.createOpenConnectionCt cts.Token
             return! Repository.getStreamByName cts.Token conn steamName

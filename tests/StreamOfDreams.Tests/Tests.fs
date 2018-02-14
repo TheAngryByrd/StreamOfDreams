@@ -726,46 +726,49 @@ module All =
                         |> Promise.start
                     let! outputDone =
                          outputStream
-                         |> Stream.takeUntil (Alt.fromCT cts.Token)
+                        //  |> Stream.takeUntil (Alt.fromCT cts.Token)
                          |> Stream.iterJob ^ fun (conn, ack, event, doneAck) -> job {
 
 
-                            // let byEventTypes =
-                            //     event
-                            //     |> Seq.groupBy(fun e -> e.EventType)
-                            //     |> Seq.map(fun (eventType, events) -> job {
-                            //         let streamName = events |> Seq.head |> createByEventType
-                            //         let! streamInfo = eventstore.GetStreamInfo2 conn streamName
-                            //         let version =
-                            //             match streamInfo with
-                            //             | Some s -> s.Version
-                            //             | None -> 0UL
+                            let! byEventTypes =
+                                event
+                                |> Seq.groupBy(fun e -> e.EventType)
+                                |> Seq.map(fun (eventType, events) -> job {
+                                    let streamName = events |> Seq.head |> createByEventType
+                                    let! streamInfo = eventstore.GetStreamInfo2 conn streamName
+                                    let version =
+                                        match streamInfo with
+                                        | Some s -> s.Version
+                                        | None -> 0UL
 
+                                    return (streamName, (DomainTypes.Version.Value version), events |> Seq.map(fun e -> e.Id))
 
-                            //         let! result =
-                            //             events
-                            //             |> Seq.map(fun e -> e.Id)
-                            //             |> eventstore.LinkToStreamTransaction conn doneAck streamName (DomainTypes.Version.Value version)
-                            //         printfn "result: %A" result
-                            //         do! ack
-                            //         return result
-                            //     })
-                            let streamName = event|> createByEventType
-                            let! streamInfo = eventstore.GetStreamInfo2 conn streamName
-                            let version =
-                                match streamInfo with
-                                | Some s -> s.Version
-                                | None -> 0UL
-
+                                })
+                                |> Job.seqCollect
 
                             let! result =
-                                [event]
-                                |> Seq.map(fun e -> e.Id)
-                                |> eventstore.LinkToStreamTransaction conn doneAck streamName (DomainTypes.Version.Value version)
+                                byEventTypes
+                                :> seq<_>
+                                |> eventstore.LinkToStreamTransactionBatch conn doneAck
                             printfn "result: %A" result
                             do! ack
+                            // return result
+                            // let streamName = event|> createByEventType
+                            // let! streamInfo = eventstore.GetStreamInfo2 conn streamName
+                            // let version =
+                            //     match streamInfo with
+                            //     | Some s -> s.Version
+                            //     | None -> 0UL
 
-                            //TODO: keep track of version
+
+                            // let! result =
+                            //     [event]
+                            //     |> Seq.map(fun e -> e.Id)
+                            //     |> eventstore.LinkToStreamTransaction conn doneAck streamName (DomainTypes.Version.Value version)
+                            // printfn "result: %A" result
+                            // do! ack
+
+                            // TODO: keep track of version
                             // let! results =
                             //     byEventTypes
                             //     |> Job.seqCollect
@@ -774,7 +777,7 @@ module All =
                             //     [|event.Id|]
                             //     |> Array.toSeq
                             //     |> eventstore.LinkToStreamTransaction conn doneAck streamName (DomainTypes.Version.Value version)
-                            printfn "result %A" result
+                            // printfn "result %A" result
 
                             return ()
                          }
@@ -783,27 +786,25 @@ module All =
 
                     do! timeOutMillis 1000
                     let eventCount = 1000
+                    for i in 1..100 do
+                        let events = generatePeopleEvents eventCount |> Seq.toArray
 
-                    let events = generatePeopleEvents eventCount |> Seq.toArray
+                        do! eventstore.AppendToStream streamName DomainTypes.Version.Any events
+                            |> Job.Ignore
 
-                    do! eventstore.AppendToStream streamName DomainTypes.Version.Any events |> Job.Ignore
-                    let events = generatePeopleEvents eventCount |> Seq.toArray
-                    do! eventstore.AppendToStream streamName DomainTypes.Version.Any events |> Job.Ignore
-                    let events = generatePeopleEvents eventCount |> Seq.toArray
 
-                    do! eventstore.AppendToStream streamName DomainTypes.Version.Any events |> Job.Ignore
-                    let events = generatePeopleEvents eventCount |> Seq.toArray
-                    do! eventstore.AppendToStream streamName DomainTypes.Version.Any events |> Job.Ignore
-                    let events = generatePeopleEvents eventCount |> Seq.toArray
-
-                    do! eventstore.AppendToStream streamName DomainTypes.Version.Any events |> Job.Ignore
-                    let events = generatePeopleEvents eventCount |> Seq.toArray
-                    do! eventstore.AppendToStream streamName DomainTypes.Version.Any events |> Job.Ignore
-
-                    do! timeOutMillis 30000
+                    // printfn "waiting"
+                    do! timeOutMillis 1000
                     cts.Dispose()
-                    do! notifyingDone
-                    do! outputDone
+
+                    // do! notifyingDone
+                    // do! outputDone
+                    // printfn "GCing"
+                    // GC.Collect()
+                    // GC.WaitForPendingFinalizers()
+
+                    // printfn "GCing complete"
+                    // do! timeOutMillis 10000
                     return ()
                 }
                 // testCaseJob' "Foo" <| fun db -> job {
