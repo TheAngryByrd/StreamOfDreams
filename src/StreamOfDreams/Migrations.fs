@@ -27,7 +27,8 @@ module Migrations =
                         stream_id bigserial PRIMARY KEY NOT NULL,
                         stream_name text NOT NULL,
                         stream_version bigint default 0 NOT NULL,
-                        created_at timestamp without time zone default (now() at time zone 'utc') NOT NULL
+                        created_at timestamp without time zone default (now() at time zone 'utc') NOT NULL,
+                        UNIQUE (stream_name,stream_version)
                     );
                     """
             override __.Down () =

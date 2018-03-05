@@ -690,9 +690,10 @@ module All =
 
             yield! testFixtureAsync withMigratedDatabase [
                 testCaseJob' "Subscriber no events yet" <| fun db -> job {
+                    let random = Random(42)
                     use cts = new Disposable.CTSCancelOnDispose()
                     let ct = cts.Token
-                    let connStr = db.Conn
+                    let connStr = db.Conn |> helpfulConnStrAddtions
                     let! notifier =
                         StreamOfDreams.Subscriptions.startNotify ct connStr
 
@@ -708,13 +709,15 @@ module All =
                             "GET ALL"
                             DomainTypes.SubscriptionPosition.Continue
                             src
-                            1000UL
+                            13100UL
 
-                    let streamName = "Bank-124562"
+                    let streamName () =
+
+                         sprintf "Bank-%d" (random.Next(0,5))
                     let eventCount = 100
 
                     let events = generatePeopleEvents eventCount |> Seq.toArray
-                    do! eventstore.AppendToStream streamName DomainTypes.Version.Any events |> Job.Ignore
+                    do! eventstore.AppendToStream (streamName ()) DomainTypes.Version.Any events |> Job.Ignore
                     // do! Commands.appendToStream streamName DomainTypes.Version.Any events writer
                     //     |> Job.Ignore
                     let outputStream = Stream.Src.tap src
@@ -735,6 +738,7 @@ module All =
                                 |> Seq.groupBy(fun e -> e.EventType)
                                 |> Seq.map(fun (eventType, events) -> job {
                                     let streamName = events |> Seq.head |> createByEventType
+                                    // printfn "streamname %A" streamName
                                     let! streamInfo = eventstore.GetStreamInfo2 conn streamName
                                     let version =
                                         match streamInfo with
@@ -750,7 +754,7 @@ module All =
                                 byEventTypes
                                 :> seq<_>
                                 |> eventstore.LinkToStreamTransactionBatch conn doneAck
-                            printfn "result: %A" result
+                            // printfn "result: %A" result
                             do! ack
                             // return result
                             // let streamName = event|> createByEventType
@@ -783,20 +787,39 @@ module All =
                          }
                          |> Promise.start
 
+                    let times = 10
+                    // do! timeOutMillis 1000
+                    let eventCount2 = 13106
 
-                    do! timeOutMillis 1000
-                    let eventCount = 1000
-                    for i in 1..100 do
-                        let events = generatePeopleEvents eventCount |> Seq.toArray
+                    let finished = uint64 (eventCount + (times * eventCount2) - 1)
+                    for i in 1..times do
+                        let events = generatePeopleEvents eventCount2 |> Seq.toArray
 
-                        do! eventstore.AppendToStream streamName DomainTypes.Version.Any events
+                        eventstore.AppendToStream (streamName ()) DomainTypes.Version.Any events
                             |> Job.Ignore
+                            |> start
 
+                    // do! timeOutMillis 3000
+                    let! stream =
+                        StreamOfDreams.Repository.readEventsForwardForever cts.Token connStr "$et-person" 0UL 1000UL
+                        |> Job.map Option.get
+                    do!
+                        stream
+                        |> Stream.takeWhileFun(fun (x : RecordedEvent) ->
+                            // printfn "sn %A" x.StreamVersion
+                            x.StreamVersion < finished)
+                        |> Stream.iterFun (ignore )
 
-                    // printfn "waiting"
-                    do! timeOutMillis 1000
+                    do! timeOutMillis 100
+                    let! streamInfo = eventstore.GetStreamInfo "$et-person"
+                    let streamInfo = streamInfo |> Option.get
+                    printfn "%A" streamInfo
+                    // printfn "waiting"`
+                    // do! timeOutMillis 100000
                     cts.Dispose()
-
+                    do! timeOutMillis 100
+                    printfn "Console enter"
+                    Console.ReadLine() |> ignore
                     // do! notifyingDone
                     // do! outputDone
                     // printfn "GCing"

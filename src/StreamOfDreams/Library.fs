@@ -1,5 +1,28 @@
 namespace StreamOfDreams
 
+open StreamOfDreams.Logging
+
+[<AutoOpen>]
+module Log =
+    open Hopac
+    open System.Diagnostics
+    let internal logger = Log.create "StreamOfDreams"
+
+
+    let timeJob pointName (fn : 'input -> Job<'res>) : 'input -> Job<'res> =
+        fun input ->
+          job {
+            let sw = Stopwatch.StartNew()
+            let! res = fn input
+            sw.Stop()
+
+            // https://github.com/logary/logary/blob/master/src/adapters/Logary.Adapters.Facade/Logary.Adapters.Facade.fs#L91
+            let message =
+                Message.gauge (sw.ElapsedMilliseconds) "ms"
+                |> Message.setName [|pointName|]
+            logger.logSimple message
+            return res
+          }
 
 module Json =
     open Newtonsoft.Json
@@ -29,128 +52,7 @@ module DomainTypes =
     | Value of uint64
 
 
-module DbHelpers =
-    open System
-    open Npgsql
-    open NpgsqlTypes
-    open Hopac
-    open System.Threading
 
-
-    let inline builderToConnection (connStr : NpgsqlConnectionStringBuilder) =
-        new NpgsqlConnection (connStr |> string)
-
-    // let inline ensureOpen (connection : NpgsqlConnection) =
-    //     if not <| connection.FullState.HasFlag System.Data.ConnectionState.Open then
-    //         Alt.fromUnitTask (connection.OpenAsync)
-    //     else
-    //         Alt.unit()
-
-    let inline ensureOpenCt ct (connection : NpgsqlConnection) = job {
-        if not <| connection.FullState.HasFlag System.Data.ConnectionState.Open then
-            do!  (connection.OpenAsync ct) |> Job.awaitUnitTask
-
-    }
-
-    // let inline createOpenConnection (connStr : NpgsqlConnectionStringBuilder) = job {
-    //     let conn =
-    //         connStr
-    //         |> builderToConnection
-    //     do! ensureOpen conn
-    //     return conn
-    // }
-    let inline createOpenConnectionCt ct (connStr : NpgsqlConnectionStringBuilder) = job {
-        let conn =
-            connStr
-            |> builderToConnection
-        do! ensureOpenCt ct conn
-        return conn
-    }
-
-    // let inline executeReader (cmd : NpgsqlCommand) =
-    //     Alt.fromTask cmd.ExecuteReaderAsync
-    //     |> Alt.afterFun (unbox<NpgsqlDataReader>)
-
-    let inline executeReaderCt (ct: CancellationToken) (cmd : NpgsqlCommand) = job {
-        let! reader = cmd.ExecuteReaderAsync ct
-        return reader |> unbox<NpgsqlDataReader>
-    }
-
-    let inline executeScalarCt<'a> ct (cmd : NpgsqlCommand) =
-        cmd.ExecuteScalarAsync ct
-        |> Job.awaitTask
-        |> Job.map (unbox<'a>)
-
-    let inline executeNonQueryCt ct (cmd : NpgsqlCommand) =
-        cmd.ExecuteNonQueryAsync ct |> Job.awaitUnitTask
-
-    let inline executeNonQueryIgnoreCt ct (cmd : NpgsqlCommand) =
-        executeNonQueryCt ct cmd
-        |> Job.Ignore
-
-    let inline valueOrDbNull opt =
-        match opt with
-        | Some o -> o |> box
-        | None -> DBNull.Value |> box
-
-
-    let inline addParameter (cmd : NpgsqlCommand) parameter =
-        parameter |> cmd.Parameters.Add |> ignore
-
-    let inline inferredParam param (value : obj) =
-        NpgsqlParameter(param, value = value)
-
-    let inline explicitParam (dbType : NpgsqlDbType) param value =
-        NpgsqlParameter(param, dbType, Value = value)
-
-    let inline jsonBParam param value =
-        explicitParam NpgsqlDbType.Jsonb param value
-
-    let inline uuidParam param value =
-        explicitParam NpgsqlDbType.Uuid param value
-    let inline textParam param value =
-        explicitParam NpgsqlDbType.Text param value
-    let inline timestampParam param value =
-        explicitParam NpgsqlDbType.Timestamp param value
-    let inline bigintParam param value =
-        explicitParam NpgsqlDbType.Bigint param value
-
-    let inline readRow ct (reader: NpgsqlDataReader) =
-        let readValueAsync fieldIndex =
-          job {
-              let fieldName = reader.GetName fieldIndex
-              let! isNull = reader.IsDBNullAsync(fieldIndex,ct)
-              if isNull then
-                return fieldName, None
-              else
-                let! value = reader.GetFieldValueAsync(fieldIndex,ct)
-                return fieldName, Some value
-          }
-
-        [0 .. reader.FieldCount - 1]
-        |> List.map readValueAsync
-        |> Job.seqCollect
-        |> Job.map List.ofSeq
-
-    let inline readTable ct (reader: NpgsqlDataReader) =
-        let rec readRows rows = job {
-            let! canRead = reader.ReadAsync(ct)
-            if canRead then
-              let! row = readRow ct reader
-              return! readRows (row :: rows)
-            else
-              return rows
-        }
-        readRows []
-
-    let inline readFirstRow ct  (reader: NpgsqlDataReader) =
-        reader
-        |> readTable ct
-        |> Job.map Seq.tryHead
-
-    let inline mapRow ct f =
-        readTable ct
-        >> Job.map (List.choose f)
 
 module DbTypes =
     open System
@@ -231,11 +133,7 @@ module DbTypes =
         LastSeen : uint64
         CreatedAt : DateTime
     }
-open DbTypes
-open Hopac.Stream
-open System.Threading
-open Hopac
-open System.Net.NetworkInformation
+
 
 module Repository =
     open System
@@ -271,17 +169,19 @@ module Repository =
         cmd
 
     let getStreamByName ct conn (streamName : StreamName) = job {
+        logger.verbose(
+            Message.eventX "Getting info for Streamname:{streamName}"
+            >> Message.setField "streamName" streamName
+        )
         use cmd = preparestreamIdAndVersion conn streamName
         use! reader = cmd |> executeReaderCt ct
 
         let! rowOpt = readFirstRow ct (reader)
 
         let retVal =
-            match rowOpt with
-            | None -> None
-            | Some row ->
-                row
-                |> function
+            rowOpt
+            |> Option.bind ^
+                function
                     | [ "stream_id", Some id
                         "stream_version", Some ver
                         "created_at", Some date
@@ -562,7 +462,7 @@ module Repository =
             let xs =
                 Stream.unfoldJob ^ fun (start : uint64) ->
                     job {
-                        printfn "getting batch start %A" start
+                        // printfn "getting batch start %A" start
                         if token.IsCancellationRequested then
                             return None
                         else
@@ -570,7 +470,7 @@ module Repository =
                             let returnedLength = retval |> Seq.length
                             if returnedLength = 0 then
                                 if forever then
-                                    do! timeOutMillis 25
+                                    do! timeOutMillis 250
                                     return Some ([], (start))
                                 else
                                     return None
@@ -776,49 +676,56 @@ module Commands =
     | LinkToStreamTransaction of NpgsqlConnection*Promise<unit>*StreamName*Version*seq<EventId>*Actors.ReplyChannel<Choice<AppendResult,exn>>
     | LinkToStreamTransactionBatch of NpgsqlConnection*Promise<unit>*Batch*Actors.ReplyChannel<Choice<ResizeArray<AppendResult>,exn>>
     //TODO make singleton
+
+    let private logAmount pointName amount =
+        Message.gauge (amount) ""
+                        |> Message.setName pointName
+                        |> logger.logSimple
     let create ct connectionString =
         Actors.actor <|
             fun mb -> Job.foreverServer (Mailbox.take mb >>= function
                 | AppendToStream(name,version,events, reply) ->
                     job {
-                        printfn "AppendToStream start"
-                        let! result = appendToStream' ct connectionString name version events |> Job.catch
+                        logAmount [|"appendToStream'"|] (events |> Seq.length |> int64)
+                        let! result =
+                            timeJob "appendToStream'" (fun () ->
+                               appendToStream' ct connectionString name version events |> Job.catch
+                            ) ()
                         do! Actors.reply reply result
-                        printfn "AppendToStream Finished"
                     }
                 | LinkToStream(name,version,eventIds, reply) ->
                     job {
-                        printfn "LinkToStream start"
-                        let! result = linkToStream' ct connectionString name version eventIds |> Job.catch
-                        do! Actors.reply reply result
+                        logAmount [|"linkToStream'"|] (eventIds |> Seq.length |> int64)
+                        let! result =
+                            timeJob "linkToStream'" (fun () ->
+                                linkToStream' ct connectionString name version eventIds |> Job.catch
+                            ) ()
 
-                        printfn "LinkToStream Finished"
+                        do! Actors.reply reply result
                     }
                 | LinkToStreamTransaction(conn,doneAck, name,version,eventIds, reply) ->
                     job {
-                        printfn "LinkToStreamTransaction start"
-                        let! result = linkToStream'' ct conn name version eventIds |> Job.catch
+                        logAmount [|"linkToStream''"|] (eventIds |> Seq.length |> int64)
+                        let! result =
+                            timeJob  "linkToStream''" (fun () ->
+                                linkToStream'' ct conn name version eventIds |> Job.catch
+                            ) ()
                         do! Actors.reply reply result
                         do! doneAck
-                        // do! timeOutMillis 1
-                        printfn "LinkToStreamTransaction Finished"
                     }
                 | LinkToStreamTransactionBatch(conn,doneAck, batch, reply) ->
                     job {
-                        printfn "LinkToStreamTransactionBatch start"
                         let! results =
-                            batch
-                            |> Seq.map ^ fun (name,version,eventIds) -> job {
-                                return! linkToStream'' ct conn name version eventIds
-                            }
-                            |> Job.seqCollect
-                            |> Job.catch
-                        printfn "batch: %A" batch
+                            timeJob  "linkToStream''.batch" (fun () ->
+                                batch
+                                |> Seq.map ^ fun (name,version,eventIds) -> job {
+                                    logAmount [|"linkToStream''.batch"|] (eventIds |> Seq.length |> int64)
+                                    return! linkToStream'' ct conn name version eventIds
+                                }
+                                |> Job.seqCollect
+                                |> Job.catch ) ()
                         do! Actors.reply reply results
-                        printfn "waiting doneAck"
                         do! doneAck
-                        // do! timeOutMillis 1
-                        printfn "LinkToStreamTransactionBatch Finished"
                     }
             )
 
@@ -827,6 +734,12 @@ module Commands =
         |> Job.map ^ function
             | Choice1Of2 r -> r
             | Choice2Of2 ex ->
+                Log.logger.error(
+                    Message.eventX "appendToStream failure! {name} - {version}"
+                    >> Message.setField "name" name
+                    >> Message.setField "version" version
+                    >> Message.addExn ex
+                )
                 Ex.throwPreserve ex
 
     let linkToStream (name : StreamName) (version : Version) ( eventIds : EventId seq) actor =
@@ -901,13 +814,15 @@ module Subscriptions =
     type Subscriber = { notification : Ch<Notification> ; }
 
     module Subsciption =
+        open DomainTypes
+        open DbTypes
         let create
             ct
             (connStr : NpgsqlConnectionStringBuilder)
             (streamName)
             (subscriptionName)
             (subscriptionPosition : SubscriptionPosition)
-            (output : Src<NpgsqlConnection*Ack*RecordedEvent seq*Promise<unit>>)
+            (output : Stream.Src<NpgsqlConnection*Ack*RecordedEvent seq*Promise<unit>>)
             readLimit = job {
 
                 //TODO load or create subscription data
@@ -925,7 +840,7 @@ module Subscriptions =
                     do! cmd |> executeNonQueryIgnoreCt ct
                 }
                 //TODO Try advisory lock?
-                printfn "start"
+                // printfn "start"
                 let mutable lastSeen = subscription.LastSeen
                 let mutable init = true
                 let mutable lastReceived = 0UL
@@ -942,13 +857,13 @@ module Subscriptions =
                     use transaction = connection.BeginTransaction()
                     let ack = IVar()
                     let doneAck = IVar()
-                    do! Src.value output (connection,IVar.fill ack () |> memo,event, upcast doneAck )
+                    do! Stream.Src.value output (connection,IVar.fill ack () |> memo,event, upcast doneAck )
                     do! ack
                     lastSeen <- lastSeen + (event |> Seq.length |> uint64)
-                    printfn "last seen %A" lastSeen
+                    // printfn "last seen %A" lastSeen
                     //TODO: Save subscription
                     do! updateSubscription connection lastSeen
-                    printfn "commit transaction"
+                    // printfn "commit transaction"
                     do! transaction.CommitAsync(ct) |> Job.awaitUnitTask
                     do! IVar.fill doneAck ()
                     // scope.Complete()
@@ -958,9 +873,9 @@ module Subscriptions =
 
 
                 let catchup () = job {
-                    printfn "catchup start streamName %A lastSeen %A readLimit %A" streamName lastSeen readLimit
+                    // printfn "catchup start streamName %A lastSeen %A readLimit %A" streamName lastSeen readLimit
                     let! result = Repository.readEventsForwardBatched ct connStr streamName lastSeen readLimit
-                    printfn "catchup result: %A" result
+                    // printfn "catchup result: %A" result
                     match result with
                     | None -> ()
                     | Some stream ->
@@ -968,7 +883,7 @@ module Subscriptions =
                             // |> Stream.takeUntil (Alt.fromCT ct)
                             |> Stream.iterJob output
 
-                    printfn "catchup end"
+                    // printfn "catchup end"
                 }
 
                 //get getOrCreateSubscription
@@ -983,11 +898,11 @@ module Subscriptions =
 
                 let proc = Job.delay ^ fun () -> job {
                     if init then
-                        printfn "INIT CATCHUP lastSeen: %d / lastReceived %d " lastSeen lastReceived
+                        // printfn "INIT CATCHUP lastSeen: %d / lastReceived %d " lastSeen lastReceived
                         do! catchup ()
                         init <- false
                     else if lastSeen < lastReceived then
-                        printfn "CAN CATCHUP lastSeen: %d / lastReceived %d " lastSeen lastReceived
+                        // printfn "CAN CATCHUP lastSeen: %d / lastReceived %d " lastSeen lastReceived
                         do! catchup ()
                     else
                         // printfn "CAN GET NOTFICATIONS lastSeen: %d / lastReceived %d " lastSeen lastReceived
@@ -1061,113 +976,6 @@ module Subscriptions =
                |> Stream.Src.tap
                |> Stream.mapFun(fun arg -> Notification.parse arg.AdditionalInformation)
     }
-// module Fooy =
-//     open System
-//     open System.Collections.Generic
-//     open Npgsql
-//     open Hopac
-//     open Hopac.Infixes
-//     open System.Data
-//     open DbTypes
-
-//     let (^) x = (<|) x
-
-
-
-//     type Callback = (RecordedEvent -> Job<unit>)
-
-//     type Channel = string
-//     type Messages =
-//     | Subscribe of Guid * Channel * Callback
-//     | Unsubscribe of Guid
-//     | NewEvents of Channel * RecordedEvent array
-
-//     let ensureOpened (conn : NpgsqlConnection) = job {
-//         if conn.State <> ConnectionState.Open then
-//             do! conn.OpenAsync() |> Job.awaitUnitTask
-//     }
-
-//     let listenOn conn channel = job {
-//         use cmd = new NpgsqlCommand(sprintf "LISTEN \"%s\"" channel, conn)
-//         do! cmd.ExecuteNonQueryAsync() |> Job.awaitTask |> Job.Ignore
-//     }
-//     let unlistenOn conn channel = job {
-//         use cmd = new NpgsqlCommand(sprintf "UNLISTEN \"%s\"" channel, conn)
-//         do! cmd.ExecuteNonQueryAsync() |> Job.awaitTask |> Job.Ignore
-//     }
-
-//     type Notifier<'a> =
-//       private {putCh : Ch<'a>}
-
-//     let doLookup (args : NpgsqlNotificationEventArgs) = job {
-//         return NewEvents(args.Condition,[|RecordedEvent.Empty|])
-//         // return args.AdditionalInformation
-//     }
-
-//     let sendMessage (n : Notifier<_>) msg =
-//         n.putCh *<- msg
-
-//     let create (connBuilder : NpgsqlConnectionStringBuilder) = job {
-//             let connBuilder = NpgsqlConnectionStringBuilder(connBuilder |> string , KeepAlive = 30)
-//             let conn = new NpgsqlConnection(connBuilder |> string)
-//             do! ensureOpened conn
-//             let self = { putCh = Ch ();}
-
-//             let subscriptions = Dictionary<Channel, (Guid * Callback) ResizeArray>()
-
-//             conn.Notification.Add(doLookup >=> (sendMessage self >> asJob) >> start)
-
-//             let handleMessage msg = job {
-//                 match msg with
-//                 | Subscribe (uuid, channel, callback) ->
-//                     match subscriptions |> Dictionary.tryGet channel with
-//                     | Some subs ->
-//                         subs.RemoveAll(fun (subId,_) -> uuid = subId) |> ignore
-//                         subs.Add(uuid,callback)
-//                     | None ->
-//                         let subs = ResizeArray<_>()
-//                         subs.Add(uuid,callback)
-//                         subscriptions.Add(channel,subs)
-//                         do! listenOn conn channel
-
-//                 | Unsubscribe uuid ->
-//                     match subscriptions |> Dictionary.tryFind(fun key value -> value |> Seq.exists(fun (subId,_) -> subId = uuid)) with
-//                     | Some (channel, subs) ->
-//                         subs.RemoveAll(fun (subId,_) -> uuid = subId) |> ignore
-//                         if subs |> Seq.exists (fun (subId,_) -> uuid = subId) |> not then
-//                             do! listenOn conn channel
-//                             subscriptions.Remove(channel) |> ignore
-
-//                     | None ->
-//                         // Nothing to remove
-//                         ()
-
-//                 | NewEvents (channel,msgs) ->
-//                     match subscriptions |> Dictionary.tryGet channel with
-//                     | Some (subs) ->
-//                         do!
-//                             subs
-//                             |> Seq.collect ^ fun (_,callback) -> msgs |> Array.map callback
-//                             |> Job.conIgnore
-//                     | None ->
-//                         ()
-//             }
-//             let put () =
-//                 self.putCh ^=> handleMessage
-//             let proc = Job.delay ^ fun () ->
-//                 put ()
-
-//             return! Job.foreverServer proc >>-. self
-
-//             // return self
-//     }
-
-
-
-// module Say =
-
-//     let hello name =
-//         sprintf "Hello %s" name
 
 module Eventstore =
     open System

@@ -211,3 +211,110 @@ module Disposable =
             member __.Dispose() = __.Dispose()
 
     let inline create f = new AnonymousDisposable(f) :> IDisposable
+
+
+module DbHelpers =
+    open System
+    open Npgsql
+    open NpgsqlTypes
+    open Hopac
+    open System.Threading
+
+
+    let inline builderToConnection (connStr : NpgsqlConnectionStringBuilder) =
+        new NpgsqlConnection (connStr |> string)
+
+
+    let inline ensureOpenCt ct (connection : NpgsqlConnection) = job {
+        if not <| connection.FullState.HasFlag System.Data.ConnectionState.Open then
+            do!  (connection.OpenAsync ct) |> Job.awaitUnitTask
+    }
+
+    let inline createOpenConnectionCt ct (connStr : NpgsqlConnectionStringBuilder) = job {
+        let conn =
+            connStr
+            |> builderToConnection
+        do! ensureOpenCt ct conn
+        return conn
+    }
+
+    let inline executeReaderCt (ct: CancellationToken) (cmd : NpgsqlCommand) = job {
+        let! reader = cmd.ExecuteReaderAsync ct
+        return reader |> unbox<NpgsqlDataReader>
+    }
+
+    let inline executeScalarCt<'a> ct (cmd : NpgsqlCommand) =
+        cmd.ExecuteScalarAsync ct
+        |> Job.awaitTask
+        |> Job.map (unbox<'a>)
+
+    let inline executeNonQueryCt ct (cmd : NpgsqlCommand) =
+        cmd.ExecuteNonQueryAsync ct |> Job.awaitUnitTask
+
+    let inline executeNonQueryIgnoreCt ct (cmd : NpgsqlCommand) =
+        executeNonQueryCt ct cmd
+        |> Job.Ignore
+
+    let inline valueOrDbNull opt =
+        match opt with
+        | Some o -> o |> box
+        | None -> DBNull.Value |> box
+
+
+    let inline addParameter (cmd : NpgsqlCommand) parameter =
+        parameter |> cmd.Parameters.Add |> ignore
+
+    let inline inferredParam param (value : obj) =
+        NpgsqlParameter(param, value = value)
+
+    let inline explicitParam (dbType : NpgsqlDbType) param value =
+        NpgsqlParameter(param, dbType, Value = value)
+
+    let inline jsonBParam param value =
+        explicitParam NpgsqlDbType.Jsonb param value
+
+    let inline uuidParam param value =
+        explicitParam NpgsqlDbType.Uuid param value
+    let inline textParam param value =
+        explicitParam NpgsqlDbType.Text param value
+    let inline timestampParam param value =
+        explicitParam NpgsqlDbType.Timestamp param value
+    let inline bigintParam param value =
+        explicitParam NpgsqlDbType.Bigint param value
+
+    let inline readRow ct (reader: NpgsqlDataReader) =
+        let readValueAsync fieldIndex =
+          job {
+              let fieldName = reader.GetName fieldIndex
+              let! isNull = reader.IsDBNullAsync(fieldIndex,ct)
+              if isNull then
+                return fieldName, None
+              else
+                let! value = reader.GetFieldValueAsync(fieldIndex,ct)
+                return fieldName, Some value
+          }
+
+        [0 .. reader.FieldCount - 1]
+        |> List.map readValueAsync
+        |> Job.seqCollect
+        |> Job.map List.ofSeq
+
+    let inline readTable ct (reader: NpgsqlDataReader) =
+        let rec readRows rows = job {
+            let! canRead = reader.ReadAsync(ct)
+            if canRead then
+              let! row = readRow ct reader
+              return! readRows (row :: rows )
+            else
+              return rows
+        }
+        readRows []
+        |> Job.map List.rev
+    let inline readFirstRow ct  (reader: NpgsqlDataReader) =
+        reader
+        |> readTable ct
+        |> Job.map Seq.tryHead
+
+    let inline mapRow ct f =
+        readTable ct
+        >> Job.map (List.choose f)

@@ -66,10 +66,10 @@ module DatabaseTestHelpers =
     let getEnv str =
         System.Environment.GetEnvironmentVariable str
 
-    let host () = getEnv "POSTGRES_HOST"
-    let user () = getEnv "POSTGRES_USER"
-    let pass () = getEnv "POSTGRES_PASS"
-    let db () = getEnv "POSTGRES_DB"
+    let host () = "localhost"// getEnv "POSTGRES_HOST"
+    let user () = "jimmybyrd"//getEnv "POSTGRES_USER"
+    let pass () = "postgres" //getEnv "POSTGRES_PASS"
+    let db () = "postgres" //getEnv "POSTGRES_DB"
     let superUserConnStr () = createConnString (host ()) (user ()) (pass()) (db())
 
     let getNewDatabase () = superUserConnStr () |>  DisposableDatabase.Create
